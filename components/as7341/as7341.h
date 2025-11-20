@@ -1,3 +1,9 @@
+/*
+    Made by Igor Jensen - UFES - LAEEC
+    20/11/2025
+*/
+
+#pragma once
 #ifndef AS7341_H
 #define AS7341_H
 

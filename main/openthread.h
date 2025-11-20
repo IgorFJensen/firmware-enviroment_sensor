@@ -1,3 +1,8 @@
+/*
+    Made by Igor Jensen - UFES - LAEEC
+    20/11/2025
+*/
+
 #ifndef OPENTHREAD_H
 #define OPENTHREAD_H
 

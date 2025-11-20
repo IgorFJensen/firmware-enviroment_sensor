@@ -1,3 +1,8 @@
+/*
+    Made by Igor Jensen - UFES - LAEEC
+    20/11/2025
+*/
+
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -87,6 +92,7 @@ void app_main(void)
     if(shtc1_init(bus_handle) != ESP_OK){
         printf("Falha ao inicializar AS7341.\n");
     }
+
     // Inicializa NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -96,6 +102,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(esp_netif_init());    
     ESP_ERROR_CHECK(esp_vfs_eventfd_register(&eventfd_config));
+
 
     // Verifica a heap antes de criar a tarefa
     print_heap_status();
@@ -110,10 +117,13 @@ void app_main(void)
         5,
         NULL
     );
+    if (res != pdPASS) {
+        ESP_LOGE("MAIN", "Falha ao criar task");
+    }
+
     if (sensor_data_task_init() != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize and start sensor data task!");
     }
    
-
     ESP_LOGI(TAG, "app_main finalizado.");
 }

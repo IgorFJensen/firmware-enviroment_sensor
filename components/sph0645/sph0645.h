@@ -1,3 +1,9 @@
+/*
+    Made by Igor Jensen - UFES - LAEEC
+    20/11/2025
+    -unused
+*/
+
 #ifndef SPH0645_H
 #define SPH0645_H
 

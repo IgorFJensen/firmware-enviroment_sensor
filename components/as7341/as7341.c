@@ -1,3 +1,8 @@
+/*
+    Made by Igor Jensen - UFES - LAEEC
+    20/11/2025
+*/
+
 #include "as7341.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -130,6 +135,7 @@ esp_err_t as7341_deinit(void) {
     return ESP_OK;
 }
 
+// Lê todos os 10 canais: F1-F8 + NIR + CLEAR.
 esp_err_t as7341_read_all_channels(as7341_spectral_data_t *data) {
     if (data == NULL) return ESP_ERR_INVALID_ARG;
 
@@ -141,15 +147,20 @@ esp_err_t as7341_read_all_channels(as7341_spectral_data_t *data) {
     return as7341_read_spectral_data_6ch(data, false);
 }
 
+//Configura o tempo de integração (ATIME).
 esp_err_t as7341_set_integration_time(uint8_t atime) {
     return as7341_write_reg(AS7341_REG_ATIME, atime);
 }
 
+
+//Define o ganho do ADC interno.
 esp_err_t as7341_set_gain(as7341_gain_t gain) {
     if (gain > AS7341_GAIN_512X) gain = AS7341_GAIN_512X;
     return as7341_write_reg(AS7341_REG_CFG1, (uint8_t)gain);
 }
 
+
+//Liga ou desliga o modo de baixo consumo.
 esp_err_t as7341_set_low_power_mode(bool enable) {
     uint8_t cfg0;
     esp_err_t ret = as7341_read_reg(AS7341_REG_CFG0, &cfg0);
@@ -159,16 +170,24 @@ esp_err_t as7341_set_low_power_mode(bool enable) {
     return as7341_write_reg(AS7341_REG_CFG0, cfg0);
 }
 
+
+
 // Implementações das funções auxiliares
+
+//Escreve um byte num registrador I2C.
 static esp_err_t as7341_write_reg(uint8_t reg, uint8_t value) {
     uint8_t buf[2] = {reg, value};
     return i2c_master_transmit(as7341_handle, buf, sizeof(buf), 1000 / portTICK_PERIOD_MS);
 }
 
+
+//Lê um byte de um registrador.
 static esp_err_t as7341_read_reg(uint8_t reg, uint8_t *value) {
     return i2c_master_transmit_receive(as7341_handle, &reg, 1, value, 1, 1000 / portTICK_PERIOD_MS);
 }
 
+
+//Lê dois bytes (16 bits) de um registrador.
 static esp_err_t as7341_read_reg16(uint8_t reg, uint16_t *value) {
     uint8_t buf[2];
     esp_err_t ret = i2c_master_transmit_receive(as7341_handle, &reg, 1, buf, sizeof(buf), 1000 / portTICK_PERIOD_MS);
@@ -177,6 +196,12 @@ static esp_err_t as7341_read_reg16(uint8_t reg, uint16_t *value) {
     }
     return ret;
 }
+
+/*Configura o registrador ENABLE:
+PON → liga o chip
+SP_EN → ativa o ADC / espectrômetro
+SMUX_EN → ativa mapeamento SMUX
+*/
 
 static esp_err_t as7341_enable_features(bool pon, bool sp_en, bool smux_en) {
     uint8_t value = 0;
@@ -194,6 +219,7 @@ static esp_err_t as7341_apply_smux_config(const uint8_t *config, size_t size) {
     return as7341_write_reg(AS7341_REG_CONTROL, AS7341_CONTROL_SMUX_CMD);
 }
 
+//Faz a leitura real dos dados espectrais.
 static esp_err_t as7341_read_spectral_data_6ch(as7341_spectral_data_t *data, bool first_set) {
     static const uint8_t smux_config1[] = {
         AS7341_PHOTODIODE_F1, AS7341_PHOTODIODE_F2, AS7341_PHOTODIODE_F3, AS7341_PHOTODIODE_F4,

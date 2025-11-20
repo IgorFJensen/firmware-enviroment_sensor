@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <inttypes.h> // Make sure this is included for PRIu16
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -25,7 +25,7 @@
 #include "openthread/dataset.h"
 #include "openthread/tasklet.h"
 #include "openthread.h"
-#include "mqtt_client.h" // Necessário para a API MQTT
+#include "mqtt_client.h" 
 
 #include <time.h>
 
@@ -40,15 +40,23 @@
 
 #if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
 #include "esp_ot_cli_extension.h"
-#endif // CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
+#endif
 
-// Removed 'extern i2c_master_bus_handle_t bus_handle;' as it's not used directly
-// in sensor_data_task's read calls based on your sensor driver signatures.
-
+// --- Variáveis e Tags Globais ---
 static const char *TAG = "sensor_task";
-// Define the stack size and priority for the sensor task
-#define SENSOR_TASK_STACK_SIZE 4096 // Adjust based on complexity of sensor drivers and payload formatting
-#define SENSOR_TASK_PRIORITY   4    // Priority for the sensor task
+static const char *TAG_MQTT = "MQTT_HANDLER";
+#define SENSOR_TASK_STACK_SIZE 4096
+#define SENSOR_TASK_PRIORITY   4
+
+static esp_mqtt_client_handle_t mqtt_client;
+static bool is_mqtt_connected = false; 
+// --- Fim Variáveis Globais ---
+
+// --- Protótipos das Funções ---
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
+void mqtt_app_start(void);
+// --- Fim Protótipos ---
+
 
 static esp_netif_t *init_openthread_netif(const esp_openthread_platform_config_t *config)
 {
@@ -63,16 +71,19 @@ static esp_netif_t *init_openthread_netif(const esp_openthread_platform_config_t
 
 void ot_cli_restart_command(void *context, int argc, char *argv[])
 {
-    // Unused variables, but required by the function signature
     (void)context;
     (void)argc;
     (void)argv;
 
     otLogNotePlat("Reiniciando a placa...");
-    // Atraso curto para permitir que a mensagem seja enviada ao terminal
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();
 }
+
+// Array de comandos CLI (movido para evitar warning)
+static const otCliCommand commands[] = {
+    {"restart", NULL, ot_cli_restart_command},
+};
 
 void ot_task_worker(void *aContext)
 {
@@ -82,7 +93,6 @@ void ot_task_worker(void *aContext)
         .port_config = ESP_OPENTHREAD_DEFAULT_PORT_CONFIG(),
     };
 
-    // Initialize the OpenThread stack
     ESP_ERROR_CHECK(esp_openthread_init(&config));
 
 #if CONFIG_OPENTHREAD_STATE_INDICATOR_ENABLE
@@ -90,28 +100,23 @@ void ot_task_worker(void *aContext)
 #endif
 
 #if CONFIG_OPENTHREAD_LOG_LEVEL_DYNAMIC
-    // The OpenThread log level directly matches ESP log level
     (void)otLoggingSetLevel(CONFIG_LOG_DEFAULT_LEVEL);
 #endif
-    // Initialize the OpenThread cli
+
 #if CONFIG_OPENTHREAD_CLI
     esp_openthread_cli_init();
 #endif
-static const otCliCommand commands[] = {
-        {"restart", NULL, ot_cli_restart_command},
-};
-otCliSetUserCommands(commands, 1, esp_openthread_get_instance());
+    
+    otCliSetUserCommands(commands, 1, esp_openthread_get_instance());
 
     esp_netif_t *openthread_netif;
-    // Initialize the esp_netif bindings
     openthread_netif = init_openthread_netif(&config);
     esp_netif_set_default_netif(openthread_netif);
 
 #if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
     esp_cli_custom_command_init();
-#endif // CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
+#endif
 
-    // Run the main loop
 #if CONFIG_OPENTHREAD_CLI
     esp_openthread_cli_create_task();
 #endif
@@ -130,32 +135,88 @@ otCliSetUserCommands(commands, 1, esp_openthread_get_instance());
     vTaskDelete(NULL);
 }
 
-static esp_mqtt_client_handle_t mqtt_client;
 
-void mqtt_app_start(void) {
-const char *ipv6_broker_uri = "mqtt://kelvin:teste@[fddc:b1e9:a487:5bbd:357c:8bd1:3856:1e6]"; //:1883
-const char *test_uri = ipv6_broker_uri;
-esp_mqtt_client_config_t mqtt_cfg = {
-        .broker = {
-            .address = {
-                .uri = ipv6_broker_uri,
-            }
-        },
+void mqtt_app_start(void)
+{
+    // A porta 1883 é usada como literal
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = "mqtt://[fd3d:9cdd:1d34:2ff1:b2c5:134f:b87a:637f]:1883",
+        .broker.address.port = 1883, 
+        .credentials.username = "kelvin",
+        .credentials.client_id = "esp32_thread",
+        .credentials.authentication.password = "teste",
     };
+
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    if (mqtt_client != NULL) {
-        esp_mqtt_client_start(mqtt_client);
-        ESP_LOGI(TAG, "MQTT client starting with URI: %s", mqtt_cfg.broker.address.uri);
-    } else {
-        ESP_LOGE(TAG, "Failed to initialize MQTT client.");
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+}
+
+// FUNÇÃO CORRIGIDA PARA REMOVER O CAMPO 'esp_error_code' INEXISTENTE
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+    esp_mqtt_client_handle_t client = event->client; 
+    
+    switch (event->event_id)
+    {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG_MQTT, "MQTT_EVENT_CONNECTED: Cliente conectado com sucesso ao broker.");
+        is_mqtt_connected = true; 
+        esp_mqtt_client_subscribe(client, "/esp32c6/2/led", 0);
+        break;
+
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGW(TAG_MQTT, "MQTT_EVENT_DISCONNECTED: Cliente desconectado.");
+        is_mqtt_connected = false; 
+        break;
+
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG_MQTT, "MQTT_EVENT_SUBSCRIBED: Tópico subscrito com sucesso. msg_id=%d", event->msg_id);
+        break;
+
+    case MQTT_EVENT_UNSUBSCRIBED:
+        ESP_LOGI(TAG_MQTT, "MQTT_EVENT_UNSUBSCRIBED: msg_id=%d", event->msg_id);
+        break;
+
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGI(TAG_MQTT, "MQTT_EVENT_PUBLISHED: Mensagem enviada com sucesso. msg_id=%d", event->msg_id);
+        break;
+
+    case MQTT_EVENT_DATA:
+        ESP_LOGI(TAG_MQTT, "MQTT_EVENT_DATA: Dados recebidos!");
+        printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
+        printf("DATA=%.*s\r\n", event->data_len, event->data);
+        break;
+
+    case MQTT_EVENT_ERROR:
+        ESP_LOGE(TAG_MQTT, "MQTT_EVENT_ERROR: Erro detectado no motor MQTT.");
+        is_mqtt_connected = false; 
+        
+        // CORREÇÃO: Usamos o tipo de erro e o errno do socket para diagnóstico
+        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+             // Erro de transporte (socket)
+             ESP_LOGE(TAG_MQTT, "TCP/TLS Error (errno): %d", event->error_handle->esp_transport_sock_errno); 
+        } else {
+             // Outros erros, logando o tipo de erro e o errno do socket como diagnóstico
+             // Este log substitui a linha problemática (203)
+             ESP_LOGE(TAG_MQTT, "Outro Erro (Tipo:%d | errno:%d)", 
+                      event->error_handle->error_type, 
+                      event->error_handle->esp_transport_sock_errno);
+        }
+        break;
+
+    default:
+        ESP_LOGI(TAG_MQTT, "Outro evento: event_id=%d", event->event_id);
+        break;
     }
 }
 
-// Function to read sensor data and send it over OpenThread UDP
+
 void sensor_data_task(void *pvParameters) {
     
     int dps_ret, veml_white_ret, sht_ret, sgp_ret, sgpindex_ret, as7341_ret;
-    char payload[512]; // Buffer para a string JSON/MQTT
+    char payload[512]; 
     otError error = OT_ERROR_NONE; 
 
     otInstance *instance = esp_openthread_get_instance();
@@ -168,12 +229,14 @@ void sensor_data_task(void *pvParameters) {
     ESP_LOGI(TAG, "Waiting for OpenThread network to form/join...");
     while (otThreadGetDeviceRole(instance) == OT_DEVICE_ROLE_DISABLED ||
            otThreadGetDeviceRole(instance) == OT_DEVICE_ROLE_DETACHED) {
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Espera 1 segundo e verifica novamente
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
     ESP_LOGI(TAG, "OpenThread network connected! Device role: %d", otThreadGetDeviceRole(instance));
-    mqtt_app_start();
+    
+    // INICIA O CLIENTE MQTT APÓS O THREAD ESTAR CONECTADO (Executa apenas 1 vez)
+    mqtt_app_start(); 
 
-    vTaskDelay(pdMS_TO_TICKS(1000)); // Delay for 1 second
+    vTaskDelay(pdMS_TO_TICKS(1000));
     clock_t start_time =0, end_time = 0;
     double cpu_time_used = 0; 
 
@@ -183,15 +246,14 @@ void sensor_data_task(void *pvParameters) {
     uint16_t voc;
     int32_t vocindex;
     uint16_t white_raw;
-    as7341_spectral_data_t spectral_data = {0}; // Structure to hold AS7341 data
+    as7341_spectral_data_t spectral_data = {0};
     start_time = clock();
-    // target IPv6 address and UDP port for the Thread network
+
     otIp6Address peerAddress;
-    otIp6AddressFromString("ff03::1", &peerAddress);  // All Thread Routers multicast
-    uint16_t peerPort = 1234;  // Porta do listener no Border Router
+    otIp6AddressFromString("ff03::1", &peerAddress);
+    uint16_t peerPort = 1234;
 
 
-    //Opens the socket only once
     otUdpSocket socket;
     
     esp_openthread_lock_acquire(portMAX_DELAY);
@@ -208,7 +270,7 @@ void sensor_data_task(void *pvParameters) {
     while (1) {
         
         dps_ret = dps310_read(&temp, &press);
-        veml_white_ret = veml7700_read_white(&white_raw);     // Read raw ALS data
+        veml_white_ret = veml7700_read_white(&white_raw);
         sht_ret = shtc1_read_data(&humid);
         sgp_ret = sgp40_measure_compensated(humid.humidity, temp, &voc);
         sgpindex_ret = sgp40_get_voc_index(humid.humidity, temp, &vocindex);
@@ -244,38 +306,42 @@ void sensor_data_task(void *pvParameters) {
            if (len < 0 || len >= sizeof(payload)) {
                 ESP_LOGE("sensor_task", "Error formatting JSON payload!");
             } else {
-                // Publica via MQTT
-                int msg_id = esp_mqtt_client_publish(mqtt_client, "sensors/data", payload, 0, 1, 0);
-                ESP_LOGI("sensor_task", "MQTT message sent, id=%d: %s", msg_id, payload);
+                // VERIFICA O ESTADO DA CONEXÃO MQTT ANTES DE PUBLICAR
+                if (is_mqtt_connected) {
+                    // Publica via MQTT usando 'len' (tamanho exato)
+                    int msg_id = esp_mqtt_client_publish(mqtt_client, "sensors/data", payload, len, 1, 0); 
+                    if (msg_id > 0) {
+                        ESP_LOGI("sensor_task", "MQTT message sent, id=%d: %s", msg_id, payload);
+                    } else {
+                        ESP_LOGE("sensor_task", "MQTT Publish FAILED! (Retorno: %d)", msg_id);
+                    }
+                } else {
+                    ESP_LOGW("sensor_task", "MQTT client not connected. Skipping MQTT publish.");
+                }
             }
         
+            // Lógica de envio UDP (OpenThread)
             esp_openthread_lock_acquire(portMAX_DELAY);
 
             otMessage *message = NULL;
             otMessageInfo messageInfo;
             
             memset(&messageInfo, 0, sizeof(messageInfo));
-
-            // Prepare message info with destination address and port
             messageInfo.mPeerAddr = peerAddress;
             messageInfo.mPeerPort = peerPort;
 
-            // Create a new OpenThread message
             message = otUdpNewMessage(instance, NULL);
             if (message != NULL) {
-                // Append the payload data to the message
                 error = otMessageAppend(message, payload, strlen(payload));
                 if (error != OT_ERROR_NONE) {
                     ESP_LOGE(TAG, "Failed to append payload to message: %s", otThreadErrorToString(error));
                     otMessageFree(message);
                 } else {
-                    // Send the UDP message
                     error = otUdpSend(instance, &socket, message, &messageInfo);
                     if (error != OT_ERROR_NONE) {
                         ESP_LOGE(TAG, "Failed to send UDP message: %s", otThreadErrorToString(error));
                         otMessageFree(message);
                     } else {
-                        // Buffer to hold the string representation of the IPv6 address
                         char ip6_addr_str[OT_IP6_ADDRESS_STRING_SIZE];
                         otIp6AddressToString(&messageInfo.mPeerAddr, ip6_addr_str, sizeof(ip6_addr_str));
                         ESP_LOGI(TAG, "UDP message sent successfully to %s:%u: %s",
@@ -287,11 +353,8 @@ void sensor_data_task(void *pvParameters) {
                 ESP_LOGE(TAG, "Failed to create new UDP message (out of memory?).");
             }
             
-            // Release the OpenThread lock
             esp_openthread_lock_release();
         } else {
-            // Log error if sensor readings failed
-            // CORREÇÃO: Usando as variáveis de retorno declaradas na função.
             ESP_LOGE(TAG, "Sensor read failed! DPS=%d, SGP=%d, VEML=%d, SHT=%d, VOCidx=%d, AS7341=%d",
                 dps_ret, sgp_ret, veml_white_ret, sht_ret, sgpindex_ret, as7341_ret);
         }
@@ -299,7 +362,7 @@ void sensor_data_task(void *pvParameters) {
         cpu_time_used = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
         ESP_LOGI(TAG, "Tempo de execução: %f segundos\n", cpu_time_used);
 
-        vTaskDelay(pdMS_TO_TICKS(20000)); // Read and send every 20 seconds
+        vTaskDelay(pdMS_TO_TICKS(20000));
     }
     esp_openthread_lock_acquire(portMAX_DELAY);
     otUdpClose(instance, &socket);
@@ -312,7 +375,7 @@ esp_err_t sensor_data_task_init(void) {
         sensor_data_task,
         "sensor_task",
         SENSOR_TASK_STACK_SIZE,
-        NULL, // No specific parameters passed to the task function here
+        NULL,
         SENSOR_TASK_PRIORITY,
         NULL
     );

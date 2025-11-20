@@ -1,3 +1,8 @@
+/*
+    Made by Igor Jensen - UFES - LAEEC
+    20/11/2025
+*/
+
 #include "sgp40.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
