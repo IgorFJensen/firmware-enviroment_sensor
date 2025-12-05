@@ -35,17 +35,22 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
     }
 }
-
 void mqtt_app_start(void)
 {
     if (mqtt_client != NULL) return; // Já iniciado
 
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = "mqtt://[fd3d:9cdd:1d34:2ff1:b2c5:134f:b87a:637f]:1883",
-        .broker.address.port = 1883,
+        //.broker.address.hostname = "fd3d:9cdd:1d34:2ff1:b2c5:134f:b87a:637f", // IPv6 SEM colchetes e SEM 'mqtt://'
+.broker.address.uri = "mqtt://[fd3d:9cdd:1d34:2ff1:b2c5:134f:b87a:637f]:1883",        .broker.address.port = 1883,
+        .broker.address.transport = MQTT_TRANSPORT_OVER_TCP, // Define explicitamente que é TCP
+        
         .credentials.username = "kelvin",
         .credentials.client_id = "esp32_thread",
         .credentials.authentication.password = "teste",
+        
+        // Configurações importantes para Thread (buffer e timeouts)
+        .network.reconnect_timeout_ms = 10000,
+        .network.disable_auto_reconnect = false,
     };
 
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
