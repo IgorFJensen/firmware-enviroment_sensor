@@ -39,37 +39,25 @@ void mqtt_app_start(void)
 {
     if (mqtt_client != NULL) return;
     
-    // 1. Criar a estrutura IP para o endereço IPv6 literal
-    esp_ip_addr_t ipv6_addr;
-    
-    // Converte a string IPv6 para a estrutura ip_addr_t
-    // Note: A função exata pode variar (esp_ip6_addr_set_from_string ou ipaddr_aton)
-    if (esp_ip6_addr_set_from_string(ip_addr_get_ip6_global(&ipv6_addr), 
-                                     "fd3d:9cdd:1d34:2ff1:b2c5:134f:b87a:637f") == 0) {
-        ESP_LOGE(TAG_MQTT, "Falha ao definir o endereço IPv6.");
-        return;
-    }
-    ipv6_addr.type = IPADDR_TYPE_V6; // Define o tipo como IPv6
-
+    // Configuração OBRIGATÓRIA para IPv6 Literal sem getaddrinfo()
     esp_mqtt_client_config_t mqtt_cfg = {
-        
-        // 🚨 NOVO MÉTODO: Use o campo ip_address diretamente
-        .broker.address.ip_address = &ipv6_addr, // Ponteiro para a estrutura IP que criamos
-        .broker.address.port = 1884,                                          
-        .broker.address.transport = MQTT_TRANSPORT_OVER_TCP, 
-        
-        // ⚠️ Certifique-se de que hostname e uri ESTÃO COMENTADOS
-        // .broker.address.hostname = "fd3d:9cdd:1d34:2ff1:b2c5:134f:b87a:637f", 
+        // 1. REMOVA/COMENTE o campo .uri
         // .broker.address.uri = "mqtt://kelvin:teste@[fd3d:9cdd:1d34:2ff1:b2c5:134f:b87a:637f]:1884", 
         
+        // 2. USE hostname e port separados, e configure as credenciais
+        .broker.address.hostname = "[fd3d:9cdd:1d34:2ff1:b2c5:134f:b87a:637f]", // Endereço IPv6 puro
+        .broker.address.port = 1884,                                          // Porta
+        .broker.address.transport = MQTT_TRANSPORT_OVER_TCP,
         .credentials.username = "kelvin",
         .credentials.authentication.password = "teste",
         .credentials.client_id = "esp32_c6_sensor",
 
+        // ... o restante da sua configuração permanece igual
         .broker.verification.skip_cert_common_name_check = true,
         .network.reconnect_timeout_ms = 10000,
         .network.disable_auto_reconnect = false,
     };
+    
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     
     if (mqtt_client == NULL) {
