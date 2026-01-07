@@ -35,6 +35,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
     }
 }
+/*
 void mqtt_app_start(void)
 {
     if (mqtt_client != NULL) return;
@@ -65,6 +66,23 @@ void mqtt_app_start(void)
         return;
     }
 
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+}
+*/
+void mqtt_app_start(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+ //       .broker.address.path = 
+        .broker.address.uri = "mqtt://[fd3d:9cdd:1d34:2ff1:b2c5:134f:b87a:637f]:1883",//"[SERVER_PORT]", // IPv6 entre colchetes
+        .broker.address.port = 1883,                  // Utiliza a porta definida na macro
+        .credentials.username = "kelvin",
+        .credentials.client_id = "esp32_thread",
+        .credentials.authentication.password = "teste",
+ //       .broker.address.transport = MQTT_TRANSPORT_OVER_SSL, // Configura o transporte
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(mqtt_client);
 }

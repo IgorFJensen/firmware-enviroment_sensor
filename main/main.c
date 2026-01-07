@@ -179,8 +179,8 @@ void app_main(void)
     ESP_LOGI(TAG, "Configurando I2C...");
     i2c_master_bus_config_t bus_config = {
             .i2c_port = I2C_NUM_0,
-            .sda_io_num = GPIO_NUM_6,
-            .scl_io_num = GPIO_NUM_7,
+            .sda_io_num = GPIO_NUM_15,
+            .scl_io_num = GPIO_NUM_3,
             .clk_source = I2C_CLK_SRC_DEFAULT,
             .glitch_ignore_cnt = 7,
             .flags.enable_internal_pullup = true,

@@ -1,2 +1,2 @@
-idf_component_register(SRCS "main.c" "mqtt_handler.c" "system_init.c" "sensor_task.c"
+idf_component_register(SRCS "mqtt_handler.c" "main.c" "system_init.c" "sensor_task.c"
                        INCLUDE_DIRS ".")
