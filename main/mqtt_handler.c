@@ -35,41 +35,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
     }
 }
-/*
-void mqtt_app_start(void)
-{
-    if (mqtt_client != NULL) return;
-    
-    // Configuração OBRIGATÓRIA para IPv6 Literal sem getaddrinfo()
-    esp_mqtt_client_config_t mqtt_cfg = {
-        // 1. REMOVA/COMENTE o campo .uri
-        // .broker.address.uri = "mqtt://kelvin:teste@[fd3d:9cdd:1d34:2ff1:b2c5:134f:b87a:637f]:1884", 
-        
-        // 2. USE hostname e port separados, e configure as credenciais
-        .broker.address.hostname = "[fd3d:9cdd:1d34:2ff1:b2c5:134f:b87a:637f]", // Endereço IPv6 puro
-        .broker.address.port = 1884,                                          // Porta
-        .broker.address.transport = MQTT_TRANSPORT_OVER_TCP,
-        .credentials.username = "kelvin",
-        .credentials.authentication.password = "teste",
-        .credentials.client_id = "esp32_c6_sensor",
 
-        // ... o restante da sua configuração permanece igual
-        .broker.verification.skip_cert_common_name_check = true,
-        .network.reconnect_timeout_ms = 10000,
-        .network.disable_auto_reconnect = false,
-    };
-    
-    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    
-    if (mqtt_client == NULL) {
-        ESP_LOGE(TAG_MQTT, "FALHA: O ESP-IDF nao aceitou a URI.");
-        return;
-    }
-
-    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    esp_mqtt_client_start(mqtt_client);
-}
-*/
 void mqtt_app_start(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {

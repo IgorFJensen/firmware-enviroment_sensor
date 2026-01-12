@@ -94,7 +94,7 @@ static void sensor_loop_task(void *pvParameters)
                 dps_ret, sgp_ret, veml_ret, sht_ret, sgpidx_ret);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(20000)); // 20 segundos
+        vTaskDelay(pdMS_TO_TICKS(1000)); // 20 segundos
     }
 }
 
