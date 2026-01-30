@@ -61,5 +61,5 @@ bool mqtt_is_connected(void)
 int mqtt_publish_sensor_data(const char *payload, int len)
 {
     if (!is_mqtt_connected || mqtt_client == NULL) return -1;
-    return esp_mqtt_client_publish(mqtt_client, "sensors/data", payload, len, 1, 0);
+    return esp_mqtt_client_publish(mqtt_client, "sensors/data1", payload, len, 1, 0);
 }

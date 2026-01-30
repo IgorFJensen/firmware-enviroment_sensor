@@ -12,10 +12,10 @@
 
 // Drivers
 #include "dps310.h"
-#include "sgp40.h"
+#include "sgp40.h"  
 #include "veml7700.h"
 #include "as7341.h"
-#include "shtc1.h"
+#include "sht4x.h"
 
 #include "mqtt_handler.h"
 
@@ -49,7 +49,7 @@ static void sensor_loop_task(void *pvParameters)
     mqtt_app_start();
 
     // Variáveis de Leitura
-    shtc1_reading_t humid;
+    sht4x_reading_t humid;
     float temp = 0.0f, press = 0.0f;
     uint16_t voc = 0, white_raw = 0;
     int32_t vocindex = 0;
@@ -59,9 +59,9 @@ static void sensor_loop_task(void *pvParameters)
         // Leitura dos sensores
         int dps_ret = dps310_read(&temp, &press);
         int veml_ret = veml7700_read_white(&white_raw);
-        int sht_ret = shtc1_read_data(&humid);
-        int sgp_ret = sgp40_measure_compensated(humid.humidity, temp, &voc);
-        int sgpidx_ret = sgp40_get_voc_index(humid.humidity, temp, &vocindex);
+        int sht_ret = sht4x_read_data(&humid);
+        int sgp_ret = sgp40_measure_compensated(humid.humidity, humid.temperature, &voc);
+        int sgpidx_ret = sgp40_get_voc_index(humid.humidity, humid.temperature, &vocindex);
         int as_ret = as7341_read_all_channels(&spectral_data);
 
         if (as_ret == ESP_OK) {
@@ -72,7 +72,7 @@ static void sensor_loop_task(void *pvParameters)
         if (dps_ret == ESP_OK && sgp_ret == ESP_OK && veml_ret == ESP_OK && sht_ret == ESP_OK && sgpidx_ret == ESP_OK) {
             
             // Log das leituras (Usando PRIi32 para o int32_t)
-            ESP_LOGI(TAG, "Leitura: T=%.2f P=%.2f VOCidx=%" PRIi32 " Lux=%u", temp, press, vocindex, white_raw);
+            ESP_LOGI(TAG, "Leitura: T=%.2f Hum=%.2f Tgas=%.2f P=%.2f VOCidx=%" PRIi32 " Lux=%u", humid.temperature, humid.humidity,temp, press, vocindex, white_raw);
 
             // Formata o JSON
             int len = snprintf(payload, sizeof(payload),

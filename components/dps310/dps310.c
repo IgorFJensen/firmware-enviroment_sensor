@@ -15,7 +15,7 @@ static i2c_master_dev_handle_t dps_handle; // Handle do dispositivo I2C
 static dps310_calib_data_t calib;   // Coeficientes de calibração
 
 // Endereço e registradores do sensor
-#define DPS310_ADDR          0x76
+#define DPS310_ADDR          0x77
 #define I2C_TIMEOUT_MS       1000
 
 #define DPS310_REG_COEF      0x10
