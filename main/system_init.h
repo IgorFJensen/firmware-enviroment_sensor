@@ -33,6 +33,9 @@ extern "C" {
 // Task principal do OpenThread (Worker)
 void ot_task_worker(void *aContext);
 
+// Save/Load Operational Dataset (para acelerar reconexão após deep-sleep)
+esp_err_t save_openthread_dataset(void);
+esp_err_t load_openthread_dataset(otOperationalDatasetTlvs *dataset);
 #ifdef __cplusplus
 }
 #endif

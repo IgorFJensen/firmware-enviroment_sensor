@@ -11,6 +11,9 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_vfs_eventfd.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "esp_sleep.h"
 
 #if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
 #include "esp_ot_cli_extension.h"
@@ -79,15 +82,19 @@ void ot_task_worker(void *aContext)
 
 #if CONFIG_OPENTHREAD_AUTO_START
     otOperationalDatasetTlvs dataset;
-    otError error = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &dataset);
-    
-    // CORREÇÃO: Só tenta iniciar automaticamente se leu o dataset com sucesso
-    if (error == OT_ERROR_NONE) {
-        ESP_LOGI("OT_INIT", "Dataset encontrado, restaurando rede Thread...");
+    // Primeiro tenta carregar dataset salvo na NVS (persistido antes do deep-sleep)
+    if (load_openthread_dataset(&dataset) == ESP_OK) {
+        ESP_LOGI("OT_INIT", "Dataset carregado da NVS, restaurando rede Thread...");
         ESP_ERROR_CHECK(esp_openthread_auto_start(&dataset));
     } else {
-        // Se não tem dataset, não faz nada e deixa o dispositivo ligado esperando comandos CLI ou Joiner
-        ESP_LOGW("OT_INIT", "Nenhum dataset salvo na NVS. O dispositivo aguardará configuração via CLI ou Joiner.");
+        // Caso não exista dataset na NVS, tenta obter do próprio stack
+        otError error = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &dataset);
+        if (error == OT_ERROR_NONE) {
+            ESP_LOGI("OT_INIT", "Dataset ativo encontrado no stack, restaurando rede Thread...");
+            ESP_ERROR_CHECK(esp_openthread_auto_start(&dataset));
+        } else {
+            ESP_LOGW("OT_INIT", "Nenhum dataset disponível. O dispositivo aguardará configuração via CLI ou Joiner.");
+        }
     }
 #endif
 
@@ -97,4 +104,59 @@ void ot_task_worker(void *aContext)
     esp_netif_destroy(openthread_netif);
     esp_vfs_eventfd_unregister();
     vTaskDelete(NULL);
+}
+
+// Persist the operational dataset TLVs into NVS so they can be restored after deep-sleep
+esp_err_t save_openthread_dataset(void)
+{
+    otOperationalDatasetTlvs dataset;
+    otError err = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &dataset);
+    if (err != OT_ERROR_NONE) {
+        ESP_LOGW("OT_PERSIST", "Nenhum dataset ativo para salvar (%d)", err);
+        return ESP_FAIL;
+    }
+
+    nvs_handle_t h;
+    esp_err_t res = nvs_open("ot_ds", NVS_READWRITE, &h);
+    if (res != ESP_OK) return res;
+
+    // Salva o comprimento e os bytes TLV
+    uint32_t len = dataset.mLength;
+    res = nvs_set_u32(h, "len", len);
+    if (res != ESP_OK) { nvs_close(h); return res; }
+
+    res = nvs_set_blob(h, "tlvs", dataset.mTlvs, len);
+    if (res != ESP_OK) { nvs_close(h); return res; }
+
+    res = nvs_commit(h);
+    nvs_close(h);
+    if (res == ESP_OK) ESP_LOGI("OT_PERSIST", "Dataset salvo (%u bytes)", (unsigned)len);
+    return res;
+}
+
+// Carrega dataset da NVS para o buffer fornecido
+esp_err_t load_openthread_dataset(otOperationalDatasetTlvs *dataset)
+{
+    if (!dataset) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t h;
+    esp_err_t res = nvs_open("ot_ds", NVS_READONLY, &h);
+    if (res != ESP_OK) return res;
+
+    uint32_t len = 0;
+    res = nvs_get_u32(h, "len", &len);
+    if (res != ESP_OK) { nvs_close(h); return res; }
+
+    size_t required = len;
+    if (required == 0 || required > sizeof(dataset->mTlvs)) {
+        nvs_close(h);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    res = nvs_get_blob(h, "tlvs", dataset->mTlvs, &required);
+    if (res == ESP_OK) {
+        dataset->mLength = (uint8_t)required;
+    }
+    nvs_close(h);
+    if (res == ESP_OK) ESP_LOGI("OT_PERSIST", "Dataset carregado (%u bytes)", (unsigned)dataset->mLength);
+    return res;
 }

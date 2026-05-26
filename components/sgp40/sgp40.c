@@ -14,6 +14,8 @@ static const char *TAG = "SGP40";
 static i2c_master_dev_handle_t sgp40_handle;
 
 static GasIndexAlgorithmParams voc_algorithm_params;
+static GasIndexAlgorithmParams nox_algorithm_params;
+
 static bool voc_algorithm_initialized = false; // Flag para garantir inicialização única
 
 #define SGP40_ADDR          0x59
