@@ -32,7 +32,7 @@ static void sleep_manager_task(void *pv)
 
     ESP_LOGI(TAG, "Preparando para deep-sleep: salvando dataset e desligando sensores (GPIO19)");
     save_openthread_dataset();
-
+    as7341_deinit();
     gpio_set_level(19, 0);
     vTaskDelay(pdMS_TO_TICKS(50));
 
@@ -55,7 +55,7 @@ static void sleep_manager_task(void *pv)
     }
 
     gpio_set_level(19, 1);
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(250));
 
     ESP_LOGI(TAG, "Reinicializando sensores após wakeup...");
     if (dps310_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha DPS310 (reinit)");

@@ -312,6 +312,10 @@
 
 static const char *TAG = "AS7341";
 
+/* Diagnostic dump forward declarations (placed early to ensure visibility) */
+static void as7341_dump_regs(void);
+static void as7341_dump_smux(void);
+
 /* =========================================================
  * REGISTRADORES
  * ========================================================= */
@@ -334,6 +338,8 @@ static const char *TAG = "AS7341";
 
 #define AS7341_REG_ID           0x92
 
+#define AS7341_REG_CONTROL      0xFA
+
 /* =========================================================
  * BITS
  * ========================================================= */
@@ -342,9 +348,13 @@ static const char *TAG = "AS7341";
 #define AS7341_ENABLE_SP_EN     (1 << 1)
 #define AS7341_ENABLE_SMUXEN    (1 << 4)
 
-#define AS7341_CFG0_BANK        (1 << 4)
+#define AS7341_CFG0_BANK        (1 << 6)
 
-#define AS7341_STATUS2_AVALID   (1 << 0)
+#define AS7341_STATUS2_AVALID   (1 << 6)
+
+/* CONTROL bits */
+#define AS7341_CONTROL_SMUX_CMD  (1 << 3)
+#define AS7341_CONTROL_ADC_INIT  (1 << 0)
 
 /* =========================================================
  * SMUX CONFIG OFICIAL
@@ -419,6 +429,8 @@ static esp_err_t as7341_read_reg16(uint8_t reg, uint16_t *value)
 
     return ret;
 }
+
+/* (forward declaration moved earlier) */
 
 /* =========================================================
  * ENABLE
@@ -499,6 +511,9 @@ static esp_err_t as7341_wait_data(void)
     }
 
     ESP_LOGE(TAG, "as7341_wait_data: timeout, STATUS2=0x%02X", status);
+    /* Dump key registers for diagnostics (compare to datasheet) */
+    as7341_dump_regs();
+    as7341_dump_smux();
     return ESP_ERR_TIMEOUT;
 }
 
@@ -512,6 +527,39 @@ static void as7341_dump_regs(void)
     if (as7341_read_reg(AS7341_REG_CFG1, &v) == ESP_OK) ESP_LOGI(TAG, "REG CFG1=0x%02X", v); else ESP_LOGW(TAG, "REG CFG1 read fail");
     if (as7341_read_reg(AS7341_REG_CFG0, &v) == ESP_OK) ESP_LOGI(TAG, "REG CFG0=0x%02X", v); else ESP_LOGW(TAG, "REG CFG0 read fail");
     if (as7341_read_reg(AS7341_REG_STATUS2, &v) == ESP_OK) ESP_LOGI(TAG, "REG STATUS2=0x%02X", v); else ESP_LOGW(TAG, "REG STATUS2 read fail");
+}
+
+/* Read back SMUX registers (0..19) by switching to bank 1 temporarily */
+static void as7341_dump_smux(void)
+{
+    uint8_t orig_cfg0;
+    if (as7341_read_reg(AS7341_REG_CFG0, &orig_cfg0) != ESP_OK) {
+        ESP_LOGW(TAG, "as7341_dump_smux: failed read CFG0");
+        return;
+    }
+
+    /* switch to bank 1 */
+    if (as7341_write_reg(AS7341_REG_CFG0, orig_cfg0 | AS7341_CFG0_BANK) != ESP_OK) {
+        ESP_LOGW(TAG, "as7341_dump_smux: failed set BANK=1");
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1));
+
+    for (int i = 0; i < 20; ++i) {
+        uint8_t v = 0;
+        if (as7341_read_reg((uint8_t)i, &v) == ESP_OK) {
+            ESP_LOGI(TAG, "SMUX[%02d]=0x%02X", i, v);
+        } else {
+            ESP_LOGW(TAG, "SMUX[%02d] read fail", i);
+        }
+    }
+
+    /* restore bank */
+    if (as7341_write_reg(AS7341_REG_CFG0, orig_cfg0 & ~AS7341_CFG0_BANK) != ESP_OK) {
+        ESP_LOGW(TAG, "as7341_dump_smux: failed restore BANK=0");
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
 }
 
 /* =========================================================
@@ -556,6 +604,8 @@ static esp_err_t as7341_load_smux(
 
     vTaskDelay(pdMS_TO_TICKS(1));
 
+
+
     return ESP_OK;
 }
 
@@ -566,46 +616,46 @@ static esp_err_t as7341_load_smux(
 static esp_err_t as7341_start_measurement(
     const uint8_t *smux)
 {
-    /* STOP spectral */
-    ESP_ERROR_CHECK(
-        as7341_set_enable(
-            true,
-            false,
-            false)
-    );
-
+   ESP_ERROR_CHECK(as7341_set_enable(true, false, false));
     vTaskDelay(pdMS_TO_TICKS(1));
 
-    /* Load SMUX */
-    ESP_ERROR_CHECK(
-        as7341_load_smux(smux)
-    );
+    /* Load SMUX na RAM */
+    ESP_ERROR_CHECK(as7341_load_smux(smux));
 
-    /* Enable SMUX command */
-    ESP_ERROR_CHECK(
-        as7341_set_enable(
-            true,
-            false,
-            true)
-    );
+    /* 1. Ativa o bit SMUXEN primeiro! */
+    ESP_ERROR_CHECK(as7341_set_enable(true, false, true));
 
-    /* Wait SMUX */
+    /* 2. AGORA SIM, envia o comando de Apply SMUX */
+    ESP_ERROR_CHECK(as7341_write_reg(AS7341_REG_CONTROL, AS7341_CONTROL_SMUX_CMD));
+
+    /* Wait SMUX (vai esperar o SMUXEN voltar a 0) */
     esp_err_t ret = as7341_wait_smux();
-
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "SMUX timeout");
         return ret;
     }
 
     /* Start spectral measurement */
-    ESP_ERROR_CHECK(
-        as7341_set_enable(
-            true,
-            true,
-            false)
-    );
+    ESP_ERROR_CHECK(as7341_set_enable(true, true, false));
+    vTaskDelay(pdMS_TO_TICKS(1));
 
-    /* tempo integração */
+    /* Kick ADC conversion */
+    ESP_ERROR_CHECK(as7341_write_reg(AS7341_REG_CONTROL, AS7341_CONTROL_ADC_INIT));
+
+    /* Read back CONTROL and STATUS2 for verification */
+    uint8_t ctl = 0, st2 = 0;
+    if (as7341_read_reg(AS7341_REG_CONTROL, &ctl) == ESP_OK) {
+        ESP_LOGI(TAG, "CONTROL after ADC_INIT = 0x%02X", ctl);
+    } else {
+        ESP_LOGW(TAG, "Failed to read CONTROL after ADC_INIT");
+    }
+    if (as7341_read_reg(AS7341_REG_STATUS2, &st2) == ESP_OK) {
+        ESP_LOGI(TAG, "STATUS2 after ADC_INIT = 0x%02X", st2);
+    } else {
+        ESP_LOGW(TAG, "Failed to read STATUS2 after ADC_INIT");
+    }
+
+    /* Wait integration time */
     vTaskDelay(pdMS_TO_TICKS(50));
 
     return ESP_OK;
