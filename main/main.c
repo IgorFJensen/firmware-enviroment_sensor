@@ -95,15 +95,10 @@ void app_main(void)
     //Criação da Task do OpenThread
     ESP_LOGI(TAG, "Iniciando Task OpenThread...");
     xTaskCreate(ot_task_worker, "ot_task", 10240, xTaskGetCurrentTaskHandle(), 5, NULL);
-
-    // Cria task que prepara e entra em deep-sleep (executa uma vez por ciclo)
-    if (sleep_manager_start(bus_handle) != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao criar task sleep");
-    }
-
+    
     //Criação da Task de Aplicação (Sensores + MQTT)
     ESP_LOGI(TAG, "Iniciando Task de Sensores...");
-    if (sensor_task_start() != ESP_OK) {
+    if (sensor_task_start(bus_handle) != ESP_OK) {
         ESP_LOGE(TAG, "Falha ao criar task de sensores");
     }
 

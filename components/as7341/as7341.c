@@ -520,14 +520,7 @@ static esp_err_t as7341_wait_data(void)
 // Diagnostic dump of key registers
 static void as7341_dump_regs(void)
 {
-    uint8_t v;
-    if (as7341_read_reg(AS7341_REG_ID, &v) == ESP_OK) ESP_LOGI(TAG, "REG ID=0x%02X", v); else ESP_LOGW(TAG, "REG ID read fail");
-    if (as7341_read_reg(AS7341_REG_ENABLE, &v) == ESP_OK) ESP_LOGI(TAG, "REG ENABLE=0x%02X", v); else ESP_LOGW(TAG, "REG ENABLE read fail");
-    if (as7341_read_reg(AS7341_REG_ATIME, &v) == ESP_OK) ESP_LOGI(TAG, "REG ATIME=0x%02X", v); else ESP_LOGW(TAG, "REG ATIME read fail");
-    if (as7341_read_reg(AS7341_REG_CFG1, &v) == ESP_OK) ESP_LOGI(TAG, "REG CFG1=0x%02X", v); else ESP_LOGW(TAG, "REG CFG1 read fail");
-    if (as7341_read_reg(AS7341_REG_CFG0, &v) == ESP_OK) ESP_LOGI(TAG, "REG CFG0=0x%02X", v); else ESP_LOGW(TAG, "REG CFG0 read fail");
-    if (as7341_read_reg(AS7341_REG_STATUS2, &v) == ESP_OK) ESP_LOGI(TAG, "REG STATUS2=0x%02X", v); else ESP_LOGW(TAG, "REG STATUS2 read fail");
-}
+   }
 
 /* Read back SMUX registers (0..19) by switching to bank 1 temporarily */
 static void as7341_dump_smux(void)
@@ -642,18 +635,7 @@ static esp_err_t as7341_start_measurement(
     /* Kick ADC conversion */
     ESP_ERROR_CHECK(as7341_write_reg(AS7341_REG_CONTROL, AS7341_CONTROL_ADC_INIT));
 
-    /* Read back CONTROL and STATUS2 for verification */
-    uint8_t ctl = 0, st2 = 0;
-    if (as7341_read_reg(AS7341_REG_CONTROL, &ctl) == ESP_OK) {
-        ESP_LOGI(TAG, "CONTROL after ADC_INIT = 0x%02X", ctl);
-    } else {
-        ESP_LOGW(TAG, "Failed to read CONTROL after ADC_INIT");
-    }
-    if (as7341_read_reg(AS7341_REG_STATUS2, &st2) == ESP_OK) {
-        ESP_LOGI(TAG, "STATUS2 after ADC_INIT = 0x%02X", st2);
-    } else {
-        ESP_LOGW(TAG, "Failed to read STATUS2 after ADC_INIT");
-    }
+
 
     /* Wait integration time */
     vTaskDelay(pdMS_TO_TICKS(50));
