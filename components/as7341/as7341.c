@@ -646,12 +646,12 @@ static esp_err_t as7341_start_measurement(
 /* =========================================================
  * INIT
  * ========================================================= */
-
-esp_err_t as7341_init(
-    i2c_master_bus_handle_t i2c_bus)
+esp_err_t as7341_init(i2c_master_bus_handle_t i2c_bus) 
 {
+    // If handle exists, remove it first to allow clean re-registration after deep/light sleep routine
     if (as7341_handle != NULL) {
-        return ESP_OK;
+        i2c_master_bus_rm_device(as7341_handle);
+        as7341_handle = NULL;
     }
 
     i2c_device_config_t dev_cfg = {
@@ -660,73 +660,37 @@ esp_err_t as7341_init(
         .scl_speed_hz = 400000,
     };
 
-    ESP_ERROR_CHECK(
-        i2c_master_bus_add_device(
-            i2c_bus,
-            &dev_cfg,
-            &as7341_handle)
-    );
+    esp_err_t ret = i2c_master_bus_add_device(i2c_bus, &dev_cfg, &as7341_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao adicionar dispositivo I2C: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
     vTaskDelay(pdMS_TO_TICKS(300));
 
     uint8_t id = 0;
-
-    esp_err_t ret = as7341_read_reg(
-        AS7341_REG_ID,
-        &id);
-
+    ret = as7341_read_reg(AS7341_REG_ID, &id);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Erro leitura ID");
-        as7341_dump_regs();
         return ret;
     }
 
-    ESP_LOGI(TAG, "AS7341 ID = 0x%02X", id);
-
     if (id != 0x24) {
         ESP_LOGE(TAG, "Sensor nao encontrado (ID=0x%02X)", id);
-        as7341_dump_regs();
         return ESP_FAIL;
     }
 
-    /* Power ON */
-    ESP_ERROR_CHECK(
-        as7341_set_enable(
-            true,
-            false,
-            false)
-    );
-
+    /* Force hardware Power ON and register setup on every init invocation */
+    as7341_set_enable(true, false, false);
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    /* Integration time */
-    ESP_ERROR_CHECK(
-        as7341_write_reg(
-            AS7341_REG_ATIME,
-            29)
-    );
+    /* Apply integration time and gain profiles to unbrick measurements */
+    as7341_write_reg(AS7341_REG_ATIME, 29);
+    as7341_write_reg(AS7341_REG_ASTEP_L, 0xE7);
+    as7341_write_reg(AS7341_REG_ASTEP_H, 0x03);
+    as7341_write_reg(AS7341_REG_CFG1, 0x06); // Gain 64x
 
-    ESP_ERROR_CHECK(
-        as7341_write_reg(
-            AS7341_REG_ASTEP_L,
-            0xE7)
-    );
-
-    ESP_ERROR_CHECK(
-        as7341_write_reg(
-            AS7341_REG_ASTEP_H,
-            0x03)
-    );
-
-    /* Gain 64x */
-    ESP_ERROR_CHECK(
-        as7341_write_reg(
-            AS7341_REG_CFG1,
-            0x06)
-    );
-
-    ESP_LOGI(TAG, "AS7341 inicializado");
-
+    ESP_LOGI(TAG, "AS7341 inicializado e registrado com sucesso");
     return ESP_OK;
 }
 

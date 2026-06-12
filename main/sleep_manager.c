@@ -7,7 +7,7 @@
 #include "driver/i2c_master.h"
 #include "system_init.h"
 #include "dps310.h"
-#include "sgp40.h"
+#include "sgp41.h"
 #include "veml7700.h"
 #include "as7341.h"
 #include "sht40.h"
@@ -33,7 +33,6 @@ static void sleep_manager_task(void *pv)
     ESP_LOGI(TAG, "Preparando para deep-sleep: salvando dataset e desligando sensores (GPIO19)");
     save_openthread_dataset();
     as7341_deinit();
-    gpio_set_level(19, 0);
     vTaskDelay(pdMS_TO_TICKS(50));
 
     esp_err_t timer_res = esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_SEC * 1000000ULL);
@@ -53,16 +52,6 @@ static void sleep_manager_task(void *pv)
     } else {
         ESP_LOGI(TAG, "Acordei do light-sleep");
     }
-
-    gpio_set_level(19, 1);
-    vTaskDelay(pdMS_TO_TICKS(250));
-
-    ESP_LOGI(TAG, "Reinicializando sensores após wakeup...");
-    if (dps310_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha DPS310 (reinit)");
-    if (sgp40_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha SGP40 (reinit)");
-    if (veml7700_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha VEML7700 (reinit)");
-    if (as7341_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha AS7341 (reinit)");
-    if (sht40_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha SHT40 (reinit)");
 
     vTaskDelete(NULL);
 }

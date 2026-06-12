@@ -23,10 +23,11 @@
 
 // Drivers de sensores (apenas para init)
 #include "dps310.h"
-#include "sgp40.h"
+#include "sgp41.h"
 #include "veml7700.h"
 #include "as7341.h"
 #include "sht40.h"
+#include "mic_ics43434.h"
 
 static const char *TAG = "MAIN";
 
@@ -87,11 +88,11 @@ void app_main(void)
     // Inicialização dos Sensores
     ESP_LOGI(TAG, "Inicializando Sensores...");
     if (dps310_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha DPS310");
-    if (sgp40_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha SGP40");
+    if (sgp41_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha SGP41");
     if (veml7700_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha VEML7700");
     if (as7341_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha AS7341");
     if (sht40_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha SHT40");
-
+    if (mic_ics43434_init() != ESP_OK) ESP_LOGE(TAG, "Falha ICS43434");
     //Criação da Task do OpenThread
     ESP_LOGI(TAG, "Iniciando Task OpenThread...");
     xTaskCreate(ot_task_worker, "ot_task", 10240, xTaskGetCurrentTaskHandle(), 5, NULL);
