@@ -15,6 +15,10 @@ static i2s_chan_handle_t rx_chan = NULL;
 #define MIC_DATA_PIN  5  // SD (Data In no ESP32)
 
 esp_err_t mic_ics43434_init(void) {
+    if (rx_chan != NULL) {
+        return ESP_OK;
+    }
+
     // Aloca um novo canal RX atuando como Master
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
     esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &rx_chan);

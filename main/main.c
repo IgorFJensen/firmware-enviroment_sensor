@@ -21,6 +21,7 @@
 #include "sensor_task.h"
 #include "sleep_manager.h"
 #include "mqtt_handler.h"
+#include "audio_wakenet.h"
 // Drivers de sensores (apenas para init)
 #include "dps310.h"
 #include "sgp41.h"
@@ -93,6 +94,13 @@ void app_main(void)
     // if (as7341_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha AS7341");
     // if (sht40_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha SHT40");
     // if (mic_ics43434_init() != ESP_OK) ESP_LOGE(TAG, "Falha ICS43434");
+    // Inicializa o microfone e o WakeNet antes das demais tasks.
+    // A task de audio passa a ser a unica leitora do I2S.
+    ESP_LOGI(TAG, "Inicializando audio + WakeNet...");
+    if (audio_wakenet_start() != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao iniciar WakeNet");
+    }
+
     //Criação da Task do OpenThread
     ESP_LOGI(TAG, "Iniciando Task OpenThread...");
     xTaskCreate(ot_task_worker, "ot_task", 10240, xTaskGetCurrentTaskHandle(), 5, NULL);

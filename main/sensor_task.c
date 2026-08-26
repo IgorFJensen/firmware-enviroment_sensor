@@ -19,7 +19,7 @@
 #include "veml7700.h"
 #include "as7341.h"
 #include "sht40.h"
-#include "mic_ics43434.h"
+#include "audio_wakenet.h"
 
 #include "mqtt_handler.h"
 #include "stats_utils.h"
@@ -31,9 +31,6 @@ static const char *TAG = "SENSOR_TASK";
 #define SENSOR_TASK_PRIORITY   4
 #define SENSOR_PWR_PIN         19  
 #define MQTT_PAYLOAD_MAX_LEN 512
-
-#define AUDIO_SAMPLES_PER_READ 1024
-static int32_t audio_buffer[AUDIO_SAMPLES_PER_READ];
 
 #define CIRCULAR_SIZE 3
 #define BURST_CIRCULAR_SIZE 5
@@ -180,12 +177,6 @@ static void initialize_hardware(i2c_master_bus_handle_t bus_handle)
         ESP_LOGE(TAG, "Falha SHT40");
     }
 
-    esp_err_t mic_ret = mic_ics43434_init();
-    if (mic_ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ICS43434: %s",
-                 esp_err_to_name(mic_ret));
-    }
-
     // Leituras descartadas para estabilizar os pipelines
     float t = 0.0f;
     float p = 0.0f;
@@ -213,20 +204,9 @@ static void execute_hardware_reinit(i2c_master_bus_handle_t bus_handle)
 
 static float read_microphone_db(void)
 {
-    size_t bytes_read = 0;
-    esp_err_t mic_err = mic_ics43434_read(audio_buffer, sizeof(audio_buffer), &bytes_read);
-    if (mic_err == ESP_OK && bytes_read > 0) {
-        int samples_read = bytes_read / sizeof(int32_t);
-        double sum_squares = 0.0;
-        for (int i = 0; i < samples_read; i++) {
-            int32_t sample = audio_buffer[i] >> 8; 
-            sum_squares += ((double)sample * (double)sample);
-        }
-        double rms = sqrt(sum_squares / samples_read);
-        return (rms > 0) ? (float)(20.0 * log10(rms)) : 0.0f;
-    }
-    ESP_LOGW(TAG, "Failed to read from ICS-43434 or empty buffer");
-    return 0.0f;
+    // O I2S agora e consumido exclusivamente pela task do WakeNet.
+    // Reaproveitamos o nivel calculado a partir do mesmo bloco de audio.
+    return audio_wakenet_get_db();
 }
 
 static void execute_short_burst(i2c_master_bus_handle_t bus_handle, int burst_index, int total_repeats, burst_hist_t *out_burst_mean)
