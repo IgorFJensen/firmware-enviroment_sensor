@@ -14,6 +14,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_sleep.h"
+#include "mqtt_handler.h"
 
 #if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
 #include "esp_ot_cli_extension.h"
@@ -48,6 +49,25 @@ static const otCliCommand commands[] = {
     {"restart", ot_cli_restart_command},
 };
 
+static void openthread_state_changed_cb(otChangedFlags flags, void *ctx)
+{
+    // Verifica se houve mudança no papel (role) do dispositivo na rede Thread
+    if (flags & OT_CHANGED_THREAD_ROLE) {
+        otDeviceRole role = otThreadGetDeviceRole(esp_openthread_get_instance());
+        ESP_LOGI("OT_STATE", "Mudança de estado Thread. Novo papel: %d", role);
+        
+        // Se conectou à rede com sucesso
+        if (role == OT_DEVICE_ROLE_CHILD || role == OT_DEVICE_ROLE_ROUTER || role == OT_DEVICE_ROLE_LEADER) {
+            ESP_LOGI("OT_STATE", "Anexado à rede Thread! Iniciando MQTT...");
+            
+            // Inicia o MQTT apenas se ainda não estiver conectado
+            if (!mqtt_is_connected()) {
+                mqtt_app_start();
+            }
+        }
+    }
+}
+
 void ot_task_worker(void *aContext)
 {
     // Agora o compilador reconhece essas macros porque estão no system_init.h
@@ -79,25 +99,58 @@ void ot_task_worker(void *aContext)
 #if CONFIG_OPENTHREAD_CLI
     esp_openthread_cli_create_task();
 #endif
-
-#if CONFIG_OPENTHREAD_AUTO_START
     otOperationalDatasetTlvs dataset;
-    // Primeiro tenta carregar dataset salvo na NVS (persistido antes do deep-sleep)
+    bool dataset_ready = false;
+
+    // 1. First attempt: Try to load the dataset saved in NVS (persisted before deep-sleep)
     if (load_openthread_dataset(&dataset) == ESP_OK) {
-        ESP_LOGI("OT_INIT", "Dataset carregado da NVS, restaurando rede Thread...");
-        ESP_ERROR_CHECK(esp_openthread_auto_start(&dataset));
-    } else {
-        // Caso não exista dataset na NVS, tenta obter do próprio stack
+        ESP_LOGI("OT_INIT", "Dataset loaded from NVS, restoring Thread network...");
+        dataset_ready = true;
+    } 
+    // 2. Second attempt: If not in NVS, try to fetch it from the internal stack
+    else {
         otError error = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &dataset);
         if (error == OT_ERROR_NONE) {
-            ESP_LOGI("OT_INIT", "Dataset ativo encontrado no stack, restaurando rede Thread...");
-            ESP_ERROR_CHECK(esp_openthread_auto_start(&dataset));
-        } else {
-            ESP_LOGW("OT_INIT", "Nenhum dataset disponível. O dispositivo aguardará configuração via CLI ou Joiner.");
+            ESP_LOGI("OT_INIT", "Active dataset found in stack, restoring Thread network...");
+            dataset_ready = true;
+        } 
+        // 3. FALLBACK: If everything else fails, inject your hardcoded factory TLV
+        else {
+            ESP_LOGW("OT_INIT", "No dataset in NVS or stack. Injecting default factory TLV...");
+            
+            const uint8_t factory_tlv[] = {
+                0x05, 0x10, 0xbe, 0x3f, 0xcf, 0x43, 0xe8, 0x40, 0x2b, 0x39, 0xf1, 0xf7, 0x3d, 0x8a, 0xd6, 0x9b,
+                0x84, 0x36, 0x03, 0x10, 0x41, 0x4d, 0x5a, 0x4e, 0x2d, 0x54, 0x68, 0x72, 0x65, 0x61, 0x6d, 0x2d,
+                0x32, 0x36, 0x36, 0x30, 0x02, 0x08, 0x6b, 0xf9, 0x25, 0xaa, 0xf4, 0x62, 0x37, 0x10, 0x01, 0x02,
+                0x26, 0x60, 0x04, 0x10, 0x5d, 0xfd, 0x5a, 0x31, 0xc3, 0x04, 0xee, 0xc4, 0xe6, 0x03, 0x41, 0xdb,
+                0x8b, 0xd0, 0x14, 0x04, 0x35, 0x06, 0x00, 0x04, 0x00, 0x00, 0x08, 0x00, 0x00, 0x03, 0x00, 0x00,
+                0x14, 0x0c, 0x04, 0x02, 0xa0, 0xff, 0xf8, 0x0e, 0x08, 0x00, 0x00, 0x00, 0x00, 0x69, 0xf1, 0x1b,
+                0xce
+            };
+
+            dataset.mLength = sizeof(factory_tlv);
+            memcpy(dataset.mTlvs, factory_tlv, sizeof(factory_tlv));
+
+            // Apply the default dataset to the OpenThread instance
+            if (otDatasetSetActiveTlvs(esp_openthread_get_instance(), &dataset) == OT_ERROR_NONE) {
+                ESP_LOGI("OT_INIT", "Default factory TLV set successfully!");
+                dataset_ready = true;
+                
+                // Optional: Save immediately to NVS so the next boot/deep-sleep wake is faster
+                save_openthread_dataset(); 
+            } else {
+                ESP_LOGE("OT_INIT", "Critical failure while setting factory TLV.");
+            }
         }
     }
-#endif
 
+    // If a valid dataset was acquired from any of the sources, start the network
+    if (dataset_ready) {
+        ESP_ERROR_CHECK(esp_openthread_auto_start(&dataset));
+        ESP_LOGI("OT_INIT", "Thread interface automatically enabled and started.");
+    }
+
+    otSetStateChangedCallback(esp_openthread_get_instance(), openthread_state_changed_cb, NULL);
     esp_openthread_launch_mainloop();
 
     esp_openthread_netif_glue_deinit();

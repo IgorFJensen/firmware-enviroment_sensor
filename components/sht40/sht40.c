@@ -5,6 +5,7 @@
 
 #include "sht40.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -94,13 +95,20 @@ esp_err_t sht40_read_data(sht40_reading_t *reading)
 // Lê o Serial Number único do sensor
 esp_err_t sht40_read_serial(uint32_t *serial)
 {
+    if (!serial) return ESP_ERR_INVALID_ARG;
+    if (!sht40_device_handle) return ESP_ERR_INVALID_STATE;
+
     uint8_t cmd = SHT4X_CMD_READ_SERIAL;
     uint8_t raw[6];
     
     esp_err_t ret = i2c_master_transmit(sht40_device_handle, &cmd, 1, -1);
     if (ret != ESP_OK) return ret;
 
-    vTaskDelay(pdMS_TO_TICKS(1));
+    /*
+     * CONFIG_FREERTOS_HZ=100: pdMS_TO_TICKS(1) resulta em 0 ticks.
+     * Aguarda de fato o SHT40 preparar a resposta do comando 0x89.
+     */
+    esp_rom_delay_us(2000);
 
     ret = i2c_master_receive(sht40_device_handle, raw, 6, -1);
     if (ret != ESP_OK) return ret;

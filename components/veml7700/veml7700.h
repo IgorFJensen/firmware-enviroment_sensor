@@ -29,10 +29,10 @@ extern "C" {
 
 // Ganho do ALS (bits 12:11)
 typedef enum {
-    VEML7700_GAIN_X1_8 = 0x00, // Ganho 1/8
-    VEML7700_GAIN_X1_4 = 0x01, // Ganho 1/4
-    VEML7700_GAIN_X1   = 0x02, // Ganho 1 (default)
-    VEML7700_GAIN_X2   = 0x03  // Ganho 2
+    VEML7700_GAIN_X1   = 0x00, // 00b: ganho 1 (default)
+    VEML7700_GAIN_X2   = 0x01, // 01b: ganho 2
+    VEML7700_GAIN_X1_8 = 0x02, // 10b: ganho 1/8
+    VEML7700_GAIN_X1_4 = 0x03  // 11b: ganho 1/4
 } veml7700_gain_t;
 
 // Tempo de integração (bits 9:6)

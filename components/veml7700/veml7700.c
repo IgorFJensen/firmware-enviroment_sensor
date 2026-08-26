@@ -171,8 +171,9 @@ esp_err_t veml7700_init(i2c_master_bus_handle_t i2c_handle) {
     veml7700_set_integration_time(VEML7700_IT_50MS);
     veml7700_set_interrupt_enable(VEML7700_INTERRUPT_DISABLE);
 
-    veml7700_enable_power_save(VEML7700_PSM_ENABLE);
-    veml7700_set_power_save_mode(VEML7700_PSM_MODE4);
+    /* PSM4 atualiza a leitura apenas a cada ~4,1 s; o burst amostra a cada 500 ms. */
+    veml7700_set_power_save_mode(VEML7700_PSM_MODE1);
+    veml7700_enable_power_save(VEML7700_PSM_DISABLE);
 
     ESP_LOGI(TAG, "VEML7700 pronto.");
     return ESP_OK;
@@ -235,19 +236,37 @@ esp_err_t veml7700_get_interrupt_status(uint16_t *s) {
 }
 
 /* Conversão RAW -> Lux */
-float veml7700_raw_to_lux(uint16_t raw) {
-    float gain = (current_gain == VEML7700_GAIN_X1_8) ? 0.125 :
-                 (current_gain == VEML7700_GAIN_X1_4) ? 0.25  :
-                 (current_gain == VEML7700_GAIN_X1)   ? 1.0   : 2.0;
+float veml7700_raw_to_lux(uint16_t raw)
+{
+    float gain_factor;
+    switch (current_gain) {
+        case VEML7700_GAIN_X1_8: gain_factor = 0.125f; break;
+        case VEML7700_GAIN_X1_4: gain_factor = 0.25f;  break;
+        case VEML7700_GAIN_X1:   gain_factor = 1.0f;   break;
+        case VEML7700_GAIN_X2:   gain_factor = 2.0f;   break;
+        default: return 0.0f;
+    }
 
-    float it = (current_it == VEML7700_IT_25MS) ? 25 :
-               (current_it == VEML7700_IT_50MS) ? 50 :
-               (current_it == VEML7700_IT_100MS) ? 100 :
-               (current_it == VEML7700_IT_200MS) ? 200 :
-               (current_it == VEML7700_IT_400MS) ? 400 : 800;
+    float integration_ms;
+    switch (current_it) {
+        case VEML7700_IT_25MS:  integration_ms = 25.0f;  break;
+        case VEML7700_IT_50MS:  integration_ms = 50.0f;  break;
+        case VEML7700_IT_100MS: integration_ms = 100.0f; break;
+        case VEML7700_IT_200MS: integration_ms = 200.0f; break;
+        case VEML7700_IT_400MS: integration_ms = 400.0f; break;
+        case VEML7700_IT_800MS: integration_ms = 800.0f; break;
+        default: return 0.0f;
+    }
 
-    const float BASE_LSB = 0.00452;
-    float res = (BASE_LSB * (800.0 / it)) / gain;
+    /*
+     * Datasheet Vishay (rev. 1.8): 0,0042 lx/count em ganho x2 e IT=800 ms.
+     * A resolução varia inversamente com o ganho e com o tempo de integração.
+     * Na configuração deste projeto (ganho x1, IT=50 ms): 0,1344 lx/count.
+     */
+    const float base_resolution_lx = 0.0042f;
+    const float resolution_lx = base_resolution_lx
+                              * (800.0f / integration_ms)
+                              * (2.0f / gain_factor);
 
-    return raw * res;
+    return (float)raw * resolution_lx;
 }
