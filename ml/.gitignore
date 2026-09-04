@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+build/*.keras
+build/*.tflite
+build/*.json
+ml/dataset/raw/
+ml/dataset/processed/
+ml/dataset/voicevote/
+.wav
+.mp3
+.flac
+ml/build/
+runs/
+

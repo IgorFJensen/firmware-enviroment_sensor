@@ -1,3 +1,40 @@
+# Firmware Environment Sensor — TinyML Starter (ESP32-C6)
+
+Esta branch/versao substitui o WakeNet por uma arquitetura preparada para classificacao acustica TinyML. O driver ICS-43434 continua em 16 kHz e somente `audio_ml` le o I2S.
+
+## Estado desta versao
+
+- `audio_ml.c/.h`: captura I2S continua, converte ICS-43434 para PCM16 e mantem o nivel relativo `Mic(dB)`.
+- `tinyml_runtime`: ponto de integracao do futuro DSP + TensorFlow Lite Micro; nesta versao ele e propositalmente um stub compilavel.
+- `tinyml_model`: contem um `model_data.cc` vazio que sera substituido pelo exportador Python.
+- `ml/`: coleta inicial, padronizacao do dataset, Log-Mel, DS-CNN, quantizacao full INT8 e exportacao para C++.
+- WakeNet/ESP-SR nao e mais necessario no runtime.
+
+## Primeiro teste de firmware
+
+```bash
+idf.py fullclean
+idf.py reconfigure
+idf.py build
+idf.py flash monitor
+```
+
+No monitor, o esperado e algo semelhante a:
+
+```text
+AUDIO_ML: Audio TinyML ativo: 16 kHz, mono, PCM16, chunk=512 amostras
+TINYML: Runtime TinyML em modo starter: modelo ainda nao exportado.
+TINYML: 1 s de PCM passou pelo pipeline. Proximo passo: Log-Mel + modelo INT8.
+```
+
+O guia de dataset e treino esta em [`ml/README.md`](ml/README.md).
+
+> Observacao: o componente `esp-tflite-micro` ainda nao foi colocado como dependencia ativa de proposito. Primeiro validamos o dataset, o modelo e o DSP. Na etapa de integracao do interpreter, adicionaremos o componente oficial e mediremos a TensorArena real no ESP32-C6.
+
+---
+
+## Documentacao original OpenThread
+
 | Supported Targets | ESP32-C5 | ESP32-C6 | ESP32-H2 |
 | ----------------- | -------- | -------- | -------- |
 

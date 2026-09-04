@@ -40,7 +40,7 @@ void mqtt_app_start(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
  //       .broker.address.path = 
-        .broker.address.uri = "mqtt://[fd3d:9cdd:1d34:2ff1:b2c5:134f:b87a:637f]:1883",//"[SERVER_PORT]", // IPv6 entre colchetes
+        .broker.address.uri = "mqtt://[fd6b:f925:aaf4:3710:2b7a:c448:24b3:235c]:1883",//"[SERVER_PORT]", // IPv6 entre colchetes
         .broker.address.port = 1883,                  // Utiliza a porta definida na macro
         .credentials.username = "kelvin",
         .credentials.client_id = "esp32_thread",

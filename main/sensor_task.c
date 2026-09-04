@@ -19,11 +19,12 @@
 #include "veml7700.h"
 #include "as7341.h"
 #include "sht40.h"
-#include "audio_wakenet.h"
+#include "audio_ml.h"
 
 #include "mqtt_handler.h"
 #include "stats_utils.h"
 #include "esp_sleep.h"
+#include "esp_timer.h"
 
 static const char *TAG = "SENSOR_TASK";
 
@@ -71,6 +72,13 @@ static int buffer_count = 0;
 static burst_hist_t burst_buffer[BURST_CIRCULAR_SIZE];
 static int burst_buffer_head = 0;
 static int burst_buffer_count = 0;
+
+// SGP41 follows the 1 s cadence expected by the Sensirion Gas Index Algorithm.
+static bool s_sgp41_ready = false;
+static bool s_sgp41_conditioned = false;
+static int32_t s_last_voc_index = 100;
+static int32_t s_last_nox_index = 1;
+static int64_t s_last_sgp_update_us = 0;
 
 // --- FORWARD DECLARATIONS ---
 
@@ -161,7 +169,8 @@ static void initialize_hardware(i2c_master_bus_handle_t bus_handle)
         ESP_LOGE(TAG, "Falha DPS310");
     }
 
-    if (sgp41_init(bus_handle) != ESP_OK) {
+    s_sgp41_ready = (sgp41_init(bus_handle) == ESP_OK);
+    if (!s_sgp41_ready) {
         ESP_LOGE(TAG, "Falha SGP41");
     }
 
@@ -177,74 +186,150 @@ static void initialize_hardware(i2c_master_bus_handle_t bus_handle)
         ESP_LOGE(TAG, "Falha SHT40");
     }
 
-    // Leituras descartadas para estabilizar os pipelines
-    float t = 0.0f;
+    float t = 25.0f;
     float p = 0.0f;
     uint16_t als_raw = 0;
-    sht40_reading_t h = {0};
+    sht40_reading_t h = {
+        .temperature = 25.0f,
+        .humidity = 50.0f
+    };
 
     vTaskDelay(pdMS_TO_TICKS(100));
-
     dps310_read(&t, &p);
     sht40_read_data(&h);
     veml7700_read_als(&als_raw);
 
+    /*
+     * O NOx do SGP41 precisa de aproximadamente 10 s de conditioning.
+     * Como GPIO19 permanece ligado, fazemos essa etapa uma unica vez.
+     */
+    if (s_sgp41_ready && !s_sgp41_conditioned) {
+        ESP_LOGI(TAG, "SGP41: iniciando conditioning de 10 s...");
+
+        bool conditioning_ok = true;
+        for (int i = 0; i < 10; ++i) {
+            uint16_t voc_raw = 0;
+            esp_err_t err = sgp41_execute_conditioning(h.humidity, t, &voc_raw);
+
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "SGP41 conditioning %d/10 falhou: %s",
+                         i + 1,
+                         esp_err_to_name(err));
+                conditioning_ok = false;
+            }
+
+            // execute_conditioning consome aproximadamente 50 ms.
+            vTaskDelay(pdMS_TO_TICKS(950));
+        }
+
+        s_sgp41_conditioned = conditioning_ok;
+        ESP_LOGI(TAG,
+                 "SGP41 conditioning finalizado: %s",
+                 conditioning_ok ? "OK" : "com falhas; operacao continuara com retry");
+    }
+
+    s_last_sgp_update_us = 0;
     vTaskDelay(pdMS_TO_TICKS(100));
 }
 
 static void execute_hardware_reinit(i2c_master_bus_handle_t bus_handle)
 {
     if (dps310_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha DPS310 (reinit)");
-    if (sgp41_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha SGP41 (reinit)");
+
+    if (sgp41_init(bus_handle) != ESP_OK) {
+        ESP_LOGE(TAG, "Falha SGP41 (reinit)");
+        s_sgp41_ready = false;
+    } else {
+        s_sgp41_ready = true;
+    }
+
     if (veml7700_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha VEML7700 (reinit)");
     if (as7341_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha AS7341 (reinit)");
     if (sht40_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha SHT40 (reinit)");
-    vTaskDelay(pdMS_TO_TICKS(50)); 
+
+    s_last_sgp_update_us = 0;
+    vTaskDelay(pdMS_TO_TICKS(50));
 }
 
 static float read_microphone_db(void)
 {
-    // O I2S agora e consumido exclusivamente pela task do WakeNet.
-    // Reaproveitamos o nivel calculado a partir do mesmo bloco de audio.
-    return audio_wakenet_get_db();
+    // O I2S e consumido exclusivamente pela task de captura do pipeline TinyML.
+    return audio_ml_get_db();
 }
 
 static void execute_short_burst(i2c_master_bus_handle_t bus_handle, int burst_index, int total_repeats, burst_hist_t *out_burst_mean)
 {
-    const int SAMPLE_INTERVAL_MS = 500;      
-    const int BURST_DURATION_MS = 10000;     
-    const int BURST_SAMPLES = BURST_DURATION_MS / SAMPLE_INTERVAL_MS; 
+    (void)bus_handle;
+
+    const int SAMPLE_INTERVAL_MS = 500;
+    const int BURST_DURATION_MS = 10000;
+    const int BURST_SAMPLES = BURST_DURATION_MS / SAMPLE_INTERVAL_MS;
 
     float burst_temps[BURST_SAMPLES], burst_humids[BURST_SAMPLES], burst_press[BURST_SAMPLES], burst_mic[BURST_SAMPLES];
     float burst_voc[BURST_SAMPLES], burst_nox[BURST_SAMPLES];
     float burst_lux[BURST_SAMPLES];
-    
+
     float burst_f1[BURST_SAMPLES], burst_f2[BURST_SAMPLES], burst_f3[BURST_SAMPLES], burst_f4[BURST_SAMPLES];
     float burst_f5[BURST_SAMPLES], burst_f6[BURST_SAMPLES], burst_f7[BURST_SAMPLES], burst_f8[BURST_SAMPLES];
     float burst_clear[BURST_SAMPLES], burst_nir[BURST_SAMPLES];
 
     float temp = 0.0f, press = 0.0f;
     uint16_t als_raw = 0;
-    sht40_reading_t humid;
+    sht40_reading_t humid = {0};
     as7341_spectral_data_t spectral_data = {0};
 
     printf("\n--- SHORT BURST %02d/%02d (10s collection) ---\n", burst_index, total_repeats);
     printf(" Amo | T(°C) | U(%%) | P(Pa)    | Lux     | Mic(dB) | VOC | NOx | F1-F4           | F5-F8           | CLR / NIR \n");
     printf("-----+-------+-------+----------+---------+---------+-----+-----+-----------------+-----------------+-----------\n");
 
+    TickType_t next_sample_tick = xTaskGetTickCount();
+
     for (int s = 0; s < BURST_SAMPLES; ++s) {
-        float current_db = read_microphone_db();
-        int dps_ret = dps310_read(&temp, &press);
-        int veml_ret = veml7700_read_als(&als_raw);
-        int sht_ret = sht40_read_data(&humid);
-        int as_ret = as7341_read_all_channels(&spectral_data);
-        
-        int32_t local_voc = 0, local_nox = 0;
-        esp_err_t sgp_err = sgp41_get_indices(humid.humidity, temp, &local_voc, &local_nox);
-        if (sgp_err != ESP_OK) {
-            local_voc = 100;
-            local_nox = 1;
+        const float current_db = read_microphone_db();
+
+        const int dps_ret = dps310_read(&temp, &press);
+        const int veml_ret = veml7700_read_als(&als_raw);
+        const int sht_ret = sht40_read_data(&humid);
+        const int as_ret = as7341_read_all_channels(&spectral_data);
+
+        /*
+         * Os demais sensores continuam em 2 Hz.
+         * O SGP41/Gas Index e atualizado somente a cada >= 1 s.
+         */
+        const int64_t now_us = esp_timer_get_time();
+        if (s_sgp41_ready &&
+            (s_last_sgp_update_us == 0 ||
+             (now_us - s_last_sgp_update_us) >= 1000000LL)) {
+
+            const float compensation_h =
+                (sht_ret == ESP_OK) ? humid.humidity : 50.0f;
+            const float compensation_t =
+                (dps_ret == ESP_OK) ? temp : 25.0f;
+
+            int32_t voc = s_last_voc_index;
+            int32_t nox = s_last_nox_index;
+
+            esp_err_t sgp_err = sgp41_get_indices(
+                compensation_h,
+                compensation_t,
+                &voc,
+                &nox);
+
+            if (sgp_err == ESP_OK) {
+                s_last_voc_index = voc;
+                s_last_nox_index = nox;
+                s_last_sgp_update_us = now_us;
+            } else {
+                ESP_LOGW(TAG,
+                         "SGP41 update falhou; mantendo ultimo indice VOC=%" PRId32 " NOx=%" PRId32,
+                         s_last_voc_index,
+                         s_last_nox_index);
+            }
         }
+
+        const int32_t local_voc = s_last_voc_index;
+        const int32_t local_nox = s_last_nox_index;
 
         burst_temps[s]  = (dps_ret == ESP_OK) ? temp : INVALID_F;
         burst_humids[s] = (sht_ret == ESP_OK) ? humid.humidity : INVALID_F;
@@ -264,12 +349,21 @@ static void execute_short_burst(i2c_master_bus_handle_t bus_handle, int burst_in
         burst_f8[s] = (as_ret == ESP_OK) ? (float)spectral_data.f8 : 0.0f;
         burst_clear[s] = (as_ret == ESP_OK) ? (float)spectral_data.clear : 0.0f;
         burst_nir[s]   = (as_ret == ESP_OK) ? (float)spectral_data.nir : 0.0f;
-       
-        printf(" %02d  | %5.2f | %5.2f | %8.2f | %7.2f | %7.2f | %3" PRId32 " | %3" PRId32 " | %.0f %.0f %.0f %.0f | %.0f %.0f %.0f %.0f | %.0f / %.0f\n", 
-               s+1, burst_temps[s], burst_humids[s], burst_press[s], burst_lux[s], burst_mic[s], local_voc, local_nox,
-               burst_f1[s], burst_f2[s], burst_f3[s], burst_f4[s], burst_f5[s], burst_f6[s], burst_f7[s], burst_f8[s], burst_clear[s], burst_nir[s]);
-        
-        vTaskDelay(pdMS_TO_TICKS(SAMPLE_INTERVAL_MS-64));
+
+        printf(" %02d  | %5.2f | %5.2f | %8.2f | %7.2f | %7.2f | %3" PRId32 " | %3" PRId32 " | %.0f %.0f %.0f %.0f | %.0f %.0f %.0f %.0f | %.0f / %.0f\n",
+               s + 1,
+               burst_temps[s],
+               burst_humids[s],
+               burst_press[s],
+               burst_lux[s],
+               burst_mic[s],
+               local_voc,
+               local_nox,
+               burst_f1[s], burst_f2[s], burst_f3[s], burst_f4[s],
+               burst_f5[s], burst_f6[s], burst_f7[s], burst_f8[s],
+               burst_clear[s], burst_nir[s]);
+
+        vTaskDelayUntil(&next_sample_tick, pdMS_TO_TICKS(SAMPLE_INTERVAL_MS));
     }
 
     out_burst_mean->temp   = stats_mean_f(burst_temps, BURST_SAMPLES, INVALID_F);
@@ -295,7 +389,7 @@ static void execute_short_burst(i2c_master_bus_handle_t bus_handle, int burst_in
     float burst_hum_var  = stats_variance_f(burst_humids, BURST_SAMPLES, INVALID_F);
 
     printf("-----+-------+-------+----------+---------+---------+-----+-----+-----------------+-----------------+-----------\n");
-    printf("[MED]| %5.2f | %5.2f | %8.2f | %7.2f | %7.2f | %3.0f | %3.0f | %.0f %.0f %.0f %.0f | %.0f %.0f %.0f %.0f | %.0f / %.0f\n", 
+    printf("[MED]| %5.2f | %5.2f | %8.2f | %7.2f | %7.2f | %3.0f | %3.0f | %.0f %.0f %.0f %.0f | %.0f %.0f %.0f %.0f | %.0f / %.0f\n",
             out_burst_mean->temp, out_burst_mean->humid, out_burst_mean->press, out_burst_mean->lux, out_burst_mean->mic_db, out_burst_mean->voc, out_burst_mean->nox,
             out_burst_mean->f1, out_burst_mean->f2, out_burst_mean->f3, out_burst_mean->f4, out_burst_mean->f5, out_burst_mean->f6, out_burst_mean->f7, out_burst_mean->f8, out_burst_mean->clear, out_burst_mean->nir);
 
@@ -303,6 +397,16 @@ static void execute_short_burst(i2c_master_bus_handle_t bus_handle, int burst_in
     printf("    Temp -> Media: %5.2f °C | Variancia: %5.4f | Desvio Padrao: +-%5.4f °C\n", out_burst_mean->temp, burst_temp_var, sqrtf(burst_temp_var));
     printf("    Umid -> Media: %5.2f %%  | Variancia: %5.4f | Desvio Padrao: +-%5.4f %%\n", out_burst_mean->humid, burst_hum_var, sqrtf(burst_hum_var));
     printf("    VOC  -> Media: %5.1f    | NOx -> Media: %5.1f\n", out_burst_mean->voc, out_burst_mean->nox);
+
+    audio_ml_risk_status_t audio_status = {0};
+    if (audio_ml_get_risk_status(&audio_status) == ESP_OK) {
+        printf("    IA   -> RISK: %.3f | Media 5: %.3f | Votos: %u/%u | Estado: %s\n",
+               audio_status.probability,
+               audio_status.history_average,
+               audio_status.positive_votes,
+               audio_status.history_count,
+               audio_status.risk_active ? "RISCO" : "NORMAL");
+    }
 }
 
 static void push_burst_to_history(const burst_hist_t *new_burst)
@@ -354,15 +458,19 @@ static void print_burst_history(void)
         bool flag_temp_variance = (var_temp > 5.0f);
         bool flag_temp_range    = (current_temp < 20.0f || current_temp > 29.0f);
         bool flag_humid_elderly = (current_humid < 45.0f || current_humid > 85.0f);
-        bool flag_voc_alert     = (current_voc > 120.0f);
-        const char* lux_state   = (current_lux < 10.0f) ? "DARK (OFF)" : "LIT (ON)";
+        const char* lux_state = (current_lux < 10.0f) ? "DARK (OFF)" : "LIT (ON)";
+        const char* voc_state =
+            (current_voc >= 150.0f) ? "ELEVATED VS BASELINE" :
+            (current_voc >= 120.0f) ? "ABOVE BASELINE" :
+            (current_voc >= 80.0f)  ? "NEAR BASELINE" :
+                                      "BELOW BASELINE";
 
         printf(">>> SYSTEM MONITORING FLAGS & CRITICAL ALERTS <<<\n");
         printf("    [TEMP VAR] : %s (Var: %5.4f °C)\n", flag_temp_variance ? " CRITICAL SPIKE" : "OK STABLE", var_temp);
         printf("    [TEMP COMF]: %s (Current: %5.2f °C | Ideal: 20-29°C)\n", flag_temp_range ? " OUT OF RANGE" : "OK COMFORT", current_temp);
         printf("    [ELDER HUM]: %s (Current: %5.2f %%  | Ideal: 45-85%%)\n", flag_humid_elderly ? " ATTENTION (RISK)" : "OK HEALTHY", current_humid);
         printf("    [LUX STATE]: %s (Current: %.0f Lux)\n", lux_state, current_lux);
-        printf("    [AIR QUAL] : %s (Current VOC Index: %.0f | Max Safe: 120)\n", flag_voc_alert ? " POLLUTED / BAD" : "OK CLEAN AIR", current_voc);
+        printf("    [VOC INDEX]: %s (Current: %.0f | adaptive baseline ~100; nao e concentracao de seguranca)\n", voc_state, current_voc);
         printf("    Var Hist   | Var Umid: %5.4f | Var VOC: %5.2f | Var NOx: %5.2f\n", var_hum, var_voc, var_nox);
         printf("--------------------------------------------------------------------\n");
     }

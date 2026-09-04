@@ -585,26 +585,6 @@ CONFIG_PARTITION_TABLE_MD5=y
 CONFIG_OPENTHREAD_AUTO_START=y
 # end of OpenThread CLI Example
 
-#
-# ESP Speech Recognition
-#
-CONFIG_AFE_INTERFACE_V1=y
-CONFIG_SR_NSN_WEBRTC=y
-CONFIG_SR_VADN_WEBRTC=y
-
-#
-# Load Multiple Wake Words (WakeNet9s)
-#
-# CONFIG_SR_WN_WN9S_HILEXIN is not set
-# CONFIG_SR_WN_WN9S_HIESP is not set
-# CONFIG_SR_WN_WN9S_NIHAOXIAOZHI is not set
-# CONFIG_SR_WN_WN9S_HIJASON is not set
-# end of Load Multiple Wake Words (WakeNet9s)
-
-CONFIG_SR_MN_CN_NONE=y
-CONFIG_SR_MN_EN_NONE=y
-CONFIG_ESP_SR_EXTERNAL_MODEL_PATH=""
-# end of ESP Speech Recognition
 
 #
 # Compiler options

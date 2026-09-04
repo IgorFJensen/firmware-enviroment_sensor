@@ -1,0 +1,41 @@
+{
+  "model": "cremad_model_v61_voicevote_int8.tflite",
+  "size_bytes": 17136,
+  "sha256": "62374fb0f473679ab24f61f88670ad65f8aa4d2ac078565fca12501616d5a6b2",
+  "input": {
+    "shape": [1, 49, 32, 1],
+    "dtype": "int8",
+    "scale": 0.09267431497573853,
+    "zero_point": 21
+  },
+  "output": {
+    "shape": [1, 1],
+    "dtype": "int8",
+    "scale": 0.00390625,
+    "zero_point": -128
+  },
+  "operators": [
+    "CONV_2D",
+    "DEPTHWISE_CONV_2D",
+    "MEAN",
+    "FULLY_CONNECTED",
+    "LOGISTIC"
+  ],
+  "audio": {
+    "sample_rate_hz": 16000,
+    "samples": 16000,
+    "frame_length": 480,
+    "frame_step": 320,
+    "fft_length": 512,
+    "mel_bins": 32,
+    "lower_hz": 80.0,
+    "upper_hz": 7600.0
+  },
+  "decision": {
+    "activation_threshold": 0.45,
+    "activation_votes": 3,
+    "history_windows": 5,
+    "release_threshold": 0.35,
+    "release_keep_votes": 2
+  }
+}

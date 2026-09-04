@@ -21,7 +21,7 @@
 #include "sensor_task.h"
 #include "sleep_manager.h"
 #include "mqtt_handler.h"
-#include "audio_wakenet.h"
+#include "audio_ml.h"
 // Drivers de sensores (apenas para init)
 #include "dps310.h"
 #include "sgp41.h"
@@ -84,7 +84,7 @@ void app_main(void)
     gpio_set_direction(15, GPIO_MODE_OUTPUT);
     // Ao acordar (reset), ligamos GPIO19 antes de inicializar sensores
     gpio_set_level(19,1);
-    gpio_set_level(15,1);
+    gpio_set_level(15,0);
 
     // Inicialização dos Sensores
     ESP_LOGI(TAG, "Inicializando Sensores...");
@@ -94,11 +94,11 @@ void app_main(void)
     // if (as7341_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha AS7341");
     // if (sht40_init(bus_handle) != ESP_OK) ESP_LOGE(TAG, "Falha SHT40");
     // if (mic_ics43434_init() != ESP_OK) ESP_LOGE(TAG, "Falha ICS43434");
-    // Inicializa o microfone e o WakeNet antes das demais tasks.
-    // A task de audio passa a ser a unica leitora do I2S.
-    ESP_LOGI(TAG, "Inicializando audio + WakeNet...");
-    if (audio_wakenet_start() != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao iniciar WakeNet");
+    // Inicializa o microfone e o pipeline de audio TinyML antes das demais tasks.
+    // A task de audio permanece como a unica leitora do I2S.
+    ESP_LOGI(TAG, "Inicializando audio TinyML...");
+    if (audio_ml_start() != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao iniciar pipeline de audio TinyML");
     }
 
     //Criação da Task do OpenThread
