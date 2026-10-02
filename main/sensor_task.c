@@ -1,6 +1,7 @@
 /* main/sensor_task.c */
 #include "sensor_task.h"
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 #include <time.h>
 #include <math.h>
@@ -31,7 +32,20 @@ static const char *TAG = "SENSOR_TASK";
 #define SENSOR_TASK_STACK_SIZE 10240
 #define SENSOR_TASK_PRIORITY   4
 #define SENSOR_PWR_PIN         19  
-#define MQTT_PAYLOAD_MAX_LEN 512
+#define MQTT_PAYLOAD_MAX_LEN       1024
+#define MQTT_PUBLISH_TIMEOUT_MS    5000
+#define AUDIO_PAUSE_TIMEOUT_MS     1500
+#define MQTT_PRE_TX_QUIET_MS       100
+#define MQTT_POST_TX_GUARD_MS      250
+
+#define FLAG_TEMP_MIN_C            20.0f
+#define FLAG_TEMP_MAX_C            29.0f
+#define FLAG_HUMID_MIN_PCT         45.0f
+#define FLAG_HUMID_MAX_PCT         85.0f
+#define FLAG_DARK_LUX              10.0f
+#define FLAG_VOC_ELEVATED_INDEX    150.0f
+#define FLAG_NOX_ELEVATED_INDEX    10.0f
+#define FLAG_TEMP_VARIANCE_LIMIT   5.0f
 
 #define CIRCULAR_SIZE 3
 #define BURST_CIRCULAR_SIZE 5
@@ -59,6 +73,8 @@ typedef struct {
     float mic_db;
     float voc;
     float nox;
+    float temp_variance;
+    float humidity_variance;
     float f1, f2, f3, f4, f5, f6, f7, f8, clear, nir;
     uint32_t timestamp;
 } burst_hist_t;
@@ -79,6 +95,7 @@ static bool s_sgp41_conditioned = false;
 static int32_t s_last_voc_index = 100;
 static int32_t s_last_nox_index = 1;
 static int64_t s_last_sgp_update_us = 0;
+static uint32_t s_mqtt_cycle_number = 0;
 
 // --- FORWARD DECLARATIONS ---
 
@@ -88,6 +105,7 @@ static float read_microphone_db(void);
 static void execute_short_burst(i2c_master_bus_handle_t bus_handle, int burst_index, int total_repeats, burst_hist_t *out_burst_mean);
 static void push_burst_to_history(const burst_hist_t *new_burst);
 static void print_burst_history(void);
+static void publish_burst_mean(const burst_hist_t *mean, int burst_index, int total_bursts);
 static void process_long_cycle(float temp_sum, float hum_sum, float press_sum, float lux_sum, float mic_sum, float voc_sum, float nox_sum, float *spectral_sums);
 static void execute_light_sleep(void);
 
@@ -117,6 +135,13 @@ static void sensor_loop_task(void *pvParameters)
             // 2. Commit burst mean data to historical circular buffer and render logs
             push_burst_to_history(&current_burst_mean);
             print_burst_history();
+
+            /*
+             * Todas as 20 leituras deste burst ja terminaram. A task de
+             * sensores fica bloqueada aqui ate o QoS 1 ser confirmado, de
+             * forma que nenhuma nova transacao I2C comece durante o envio.
+             */
+            publish_burst_mean(&current_burst_mean, base_i + 1, BASE_REPEAT);
 
             // 3. Accumulate metrics for the upcoming long cycle processing stage
             longa_temp_sum   += current_burst_mean.temp;
@@ -387,6 +412,8 @@ static void execute_short_burst(i2c_master_bus_handle_t bus_handle, int burst_in
 
     float burst_temp_var = stats_variance_f(burst_temps, BURST_SAMPLES, INVALID_F);
     float burst_hum_var  = stats_variance_f(burst_humids, BURST_SAMPLES, INVALID_F);
+    out_burst_mean->temp_variance = burst_temp_var;
+    out_burst_mean->humidity_variance = burst_hum_var;
 
     printf("-----+-------+-------+----------+---------+---------+-----+-----+-----------------+-----------------+-----------\n");
     printf("[MED]| %5.2f | %5.2f | %8.2f | %7.2f | %7.2f | %3.0f | %3.0f | %.0f %.0f %.0f %.0f | %.0f %.0f %.0f %.0f | %.0f / %.0f\n",
@@ -400,13 +427,196 @@ static void execute_short_burst(i2c_master_bus_handle_t bus_handle, int burst_in
 
     audio_ml_risk_status_t audio_status = {0};
     if (audio_ml_get_risk_status(&audio_status) == ESP_OK) {
-        printf("    IA   -> RISK: %.3f | Media 5: %.3f | Votos: %u/%u | Estado: %s\n",
+        printf("    IA   -> RISK: %.3f | Media: %.3f | Votos: %u/%u | Estado: %s\n",
                audio_status.probability,
                audio_status.history_average,
                audio_status.positive_votes,
                audio_status.history_count,
                audio_status.risk_active ? "RISCO" : "NORMAL");
     }
+}
+
+static void publish_burst_mean(
+    const burst_hist_t *mean,
+    int burst_index,
+    int total_bursts)
+{
+    if (mean == NULL) {
+        return;
+    }
+
+    audio_ml_risk_status_t audio = {0};
+    const bool audio_status_valid =
+        (audio_ml_get_risk_status(&audio) == ESP_OK);
+
+    const bool measurement_valid =
+        mean->temp != INVALID_F &&
+        mean->humid != INVALID_F &&
+        mean->press != INVALID_F &&
+        mean->lux != INVALID_F;
+
+    const bool flag_temp_out_of_range =
+        measurement_valid &&
+        (mean->temp < FLAG_TEMP_MIN_C || mean->temp > FLAG_TEMP_MAX_C);
+
+    const bool flag_temp_variation =
+        mean->temp_variance > FLAG_TEMP_VARIANCE_LIMIT;
+
+    const bool flag_humidity_out_of_range =
+        measurement_valid &&
+        (mean->humid < FLAG_HUMID_MIN_PCT || mean->humid > FLAG_HUMID_MAX_PCT);
+
+    const bool flag_dark =
+        measurement_valid && mean->lux < FLAG_DARK_LUX;
+
+    const bool flag_voc_elevated =
+        mean->voc >= FLAG_VOC_ELEVATED_INDEX;
+
+    const bool flag_nox_elevated =
+        mean->nox >= FLAG_NOX_ELEVATED_INDEX;
+
+    const bool flag_audio_risk =
+        audio_status_valid && audio.risk_active;
+
+    const bool flag_critical =
+        flag_temp_out_of_range ||
+        flag_temp_variation ||
+        flag_humidity_out_of_range ||
+        flag_voc_elevated ||
+        flag_nox_elevated ||
+        flag_audio_risk;
+
+    const bool flag_gas_ready =
+        s_sgp41_ready && s_sgp41_conditioned;
+
+    ++s_mqtt_cycle_number;
+
+    char payload[MQTT_PAYLOAD_MAX_LEN];
+    const int len = snprintf(
+        payload,
+        sizeof(payload),
+        "{"
+        "\"device\":\"esp32c6_environment\","
+        "\"cycle\":%" PRIu32 ","
+        "\"burst\":%d,"
+        "\"total_bursts\":%d,"
+        "\"samples\":20,"
+        "\"uptime_ms\":%" PRIu64 ","
+        "\"temperature_c\":%.2f,"
+        "\"humidity_pct\":%.2f,"
+        "\"pressure_pa\":%.2f,"
+        "\"lux\":%.2f,"
+        "\"mic_db\":%.2f,"
+        "\"voc_index\":%.1f,"
+        "\"nox_index\":%.1f,"
+        "\"f1\":%.0f,\"f2\":%.0f,\"f3\":%.0f,\"f4\":%.0f,"
+        "\"f5\":%.0f,\"f6\":%.0f,\"f7\":%.0f,\"f8\":%.0f,"
+        "\"clear\":%.0f,\"nir\":%.0f,"
+        "\"audio_probability\":%.3f,"
+        "\"audio_average\":%.3f,"
+        "\"audio_votes\":%u,"
+        "\"audio_history\":%u,"
+        "\"audio_risk\":%s,"
+        "\"flags\":{"
+        "\"measurement_valid\":%s,"
+        "\"audio_status_valid\":%s,"
+        "\"gas_sensor_ready\":%s,"
+        "\"temperature_out_of_range\":%s,"
+        "\"temperature_variation\":%s,"
+        "\"humidity_out_of_range\":%s,"
+        "\"dark\":%s,"
+        "\"voc_elevated\":%s,"
+        "\"nox_elevated\":%s,"
+        "\"audio_risk\":%s,"
+        "\"critical\":%s"
+        "}"
+        "}",
+        s_mqtt_cycle_number,
+        burst_index,
+        total_bursts,
+        (uint64_t)(esp_timer_get_time() / 1000LL),
+        mean->temp,
+        mean->humid,
+        mean->press,
+        mean->lux,
+        mean->mic_db,
+        mean->voc,
+        mean->nox,
+        mean->f1, mean->f2, mean->f3, mean->f4,
+        mean->f5, mean->f6, mean->f7, mean->f8,
+        mean->clear,
+        mean->nir,
+        audio_status_valid ? audio.probability : 0.0f,
+        audio_status_valid ? audio.history_average : 0.0f,
+        audio_status_valid ? audio.positive_votes : 0U,
+        audio_status_valid ? audio.history_count : 0U,
+        flag_audio_risk ? "true" : "false",
+        measurement_valid ? "true" : "false",
+        audio_status_valid ? "true" : "false",
+        flag_gas_ready ? "true" : "false",
+        flag_temp_out_of_range ? "true" : "false",
+        flag_temp_variation ? "true" : "false",
+        flag_humidity_out_of_range ? "true" : "false",
+        flag_dark ? "true" : "false",
+        flag_voc_elevated ? "true" : "false",
+        flag_nox_elevated ? "true" : "false",
+        flag_audio_risk ? "true" : "false",
+        flag_critical ? "true" : "false");
+
+    if (len < 0 || (size_t)len >= sizeof(payload)) {
+        ESP_LOGE(TAG,
+                 "Payload MQTT excedeu o buffer de %u bytes",
+                 (unsigned)sizeof(payload));
+        return;
+    }
+
+    if (!mqtt_is_connected()) {
+        ESP_LOGW(TAG,
+                 "Media das 20 leituras pronta, mas MQTT esta desconectado; ciclo=%" PRIu32,
+                 s_mqtt_cycle_number);
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "20 leituras concluidas. Pausando sensores e audio; ciclo=%" PRIu32,
+             s_mqtt_cycle_number);
+
+    const esp_err_t pause_err =
+        audio_ml_pause(AUDIO_PAUSE_TIMEOUT_MS);
+
+    if (pause_err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "Envio cancelado porque o audio nao pausou: %s",
+                 esp_err_to_name(pause_err));
+        return;
+    }
+
+    /* Janela silenciosa depois da ultima transacao de sensor. */
+    vTaskDelay(pdMS_TO_TICKS(MQTT_PRE_TX_QUIET_MS));
+
+    int msg_id = -1;
+    const esp_err_t err = mqtt_publish_sensor_data(
+        payload,
+        (size_t)len,
+        MQTT_PUBLISH_TIMEOUT_MS,
+        &msg_id);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "Ciclo=%" PRIu32 " enviado e confirmado; msg_id=%d",
+                 s_mqtt_cycle_number,
+                 msg_id);
+    } else {
+        ESP_LOGW(TAG,
+                 "Falha enviando ciclo=%" PRIu32 ": %s",
+                 s_mqtt_cycle_number,
+                 esp_err_to_name(err));
+    }
+
+    /* Margem para o radio encerrar os ultimos pacotes antes das leituras. */
+    vTaskDelay(pdMS_TO_TICKS(MQTT_POST_TX_GUARD_MS));
+    audio_ml_resume();
+    ESP_LOGI(TAG, "Todas as leituras liberadas para o proximo burst");
 }
 
 static void push_burst_to_history(const burst_hist_t *new_burst)

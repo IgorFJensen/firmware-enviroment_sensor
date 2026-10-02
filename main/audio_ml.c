@@ -59,6 +59,9 @@ static int16_t *s_pcm_windows = NULL;
 
 static volatile uint32_t s_dropped_chunks = 0;
 static volatile uint32_t s_skipped_windows = 0;
+static volatile bool s_pause_requested = false;
+static volatile bool s_capture_paused = false;
+static volatile bool s_infer_paused = false;
 
 static bool s_led_risk_state = false;
 
@@ -231,10 +234,36 @@ static void audio_infer_task(void *arg)
         AUDIO_ML_INFERENCE_DIVIDER);
 
     while (1) {
+        if (s_pause_requested) {
+            s_infer_paused = true;
+
+            /*
+             * Devolve janelas antigas enquanto a captura termina de pausar.
+             * Assim a inferencia recomeca somente com audio posterior ao MQTT.
+             */
+            while (s_pause_requested) {
+                if (uxQueueSpacesAvailable(s_free_buffers) > 0U &&
+                    xQueueReceive(
+                        s_ready_buffers,
+                        &buffer_index,
+                        0) == pdTRUE) {
+                    xQueueSend(
+                        s_free_buffers,
+                        &buffer_index,
+                        0);
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+
+            s_infer_paused = false;
+            continue;
+        }
+
         if (xQueueReceive(
                 s_ready_buffers,
                 &buffer_index,
-                portMAX_DELAY) != pdTRUE) {
+                pdMS_TO_TICKS(20)) != pdTRUE) {
             continue;
         }
 
@@ -336,6 +365,19 @@ static void audio_capture_task(void *arg)
         AUDIO_ML_WINDOW_SAMPLES);
 
     while (1) {
+        if (s_pause_requested) {
+            /* Descarta a janela parcial para nao misturar antes/depois do MQTT. */
+            window_fill = 0;
+            s_capture_paused = true;
+
+            while (s_pause_requested) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+
+            s_capture_paused = false;
+            continue;
+        }
+
         esp_err_t err = read_exact_i2s(
             raw_buffer,
             AUDIO_ML_CHUNK_SAMPLES);
@@ -440,6 +482,10 @@ esp_err_t audio_ml_start(void)
     }
 
     risk_led_init();
+
+    s_pause_requested = false;
+    s_capture_paused = false;
+    s_infer_paused = false;
 
     esp_err_t err =
         mic_ics43434_init();
@@ -569,6 +615,45 @@ esp_err_t audio_ml_start(void)
         AUDIO_ML_INFERENCE_DIVIDER);
 
     return ESP_OK;
+}
+
+esp_err_t audio_ml_pause(uint32_t timeout_ms)
+{
+    if (s_capture_task_handle == NULL &&
+        s_infer_task_handle == NULL) {
+        return ESP_OK;
+    }
+
+    s_pause_requested = true;
+
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+
+    while (1) {
+        const bool capture_stopped =
+            s_capture_task_handle == NULL || s_capture_paused;
+        const bool infer_stopped =
+            s_infer_task_handle == NULL || s_infer_paused;
+
+        if (capture_stopped && infer_stopped) {
+            ESP_LOGI(TAG, "Captura I2S e inferencia pausadas");
+            return ESP_OK;
+        }
+
+        if ((xTaskGetTickCount() - start) >= timeout_ticks) {
+            s_pause_requested = false;
+            ESP_LOGW(TAG, "Timeout pausando pipeline de audio");
+            return ESP_ERR_TIMEOUT;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void audio_ml_resume(void)
+{
+    s_pause_requested = false;
+    ESP_LOGI(TAG, "Captura I2S e inferencia liberadas");
 }
 
 float audio_ml_get_db(void)

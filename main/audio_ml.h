@@ -17,6 +17,15 @@ extern "C" {
  */
 esp_err_t audio_ml_start(void);
 
+/**
+ * Pausa cooperativamente captura I2S e inferencia. A funcao so retorna ESP_OK
+ * quando nenhuma das duas tarefas esta lendo ou processando audio.
+ */
+esp_err_t audio_ml_pause(uint32_t timeout_ms);
+
+/** Retoma captura e inferencia depois de audio_ml_pause(). */
+void audio_ml_resume(void);
+
 /** Nivel relativo do microfone; nao e dB SPL calibrado. */
 float audio_ml_get_db(void);
 
