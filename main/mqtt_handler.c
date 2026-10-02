@@ -2,6 +2,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "esp_log.h"
@@ -14,6 +15,7 @@ static const char *TAG = "MQTT_HANDLER";
 #define MQTT_PASSWORD    "teste"
 #define MQTT_CLIENT_ID   "esp32_thread"
 #define MQTT_STATE_TOPIC "sensors/data"
+#define MQTT_ALERT_TOPIC "sensors/alert"
 
 #define MQTT_CONNECTED_BIT     BIT0
 #define MQTT_PUBLISHED_BIT     BIT1
@@ -21,6 +23,8 @@ static const char *TAG = "MQTT_HANDLER";
 
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static EventGroupHandle_t s_mqtt_events = NULL;
+/* Uma publicacao por vez: os bits de confirmacao sao compartilhados. */
+static SemaphoreHandle_t s_publish_mutex = NULL;
 static volatile bool s_mqtt_connected = false;
 static bool s_mqtt_started = false;
 
@@ -99,6 +103,14 @@ void mqtt_app_start(void)
         }
     }
 
+    if (s_publish_mutex == NULL) {
+        s_publish_mutex = xSemaphoreCreateMutex();
+        if (s_publish_mutex == NULL) {
+            ESP_LOGE(TAG, "Sem memoria para mutex de publicacao MQTT");
+            return;
+        }
+    }
+
     const esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = MQTT_BROKER_URI,
         .credentials.username = MQTT_USERNAME,
@@ -143,27 +155,20 @@ bool mqtt_is_connected(void)
     return s_mqtt_connected;
 }
 
-esp_err_t mqtt_publish_sensor_data(
+static esp_err_t publish_and_wait(
+    const char *topic,
     const char *payload,
     size_t len,
     uint32_t timeout_ms,
     int *out_msg_id)
 {
-    if (payload == NULL || len == 0U) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (!s_mqtt_connected || s_mqtt_client == NULL || s_mqtt_events == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
     xEventGroupClearBits(
         s_mqtt_events,
         MQTT_PUBLISHED_BIT | MQTT_DISCONNECTED_BIT);
 
     const int msg_id = esp_mqtt_client_publish(
         s_mqtt_client,
-        MQTT_STATE_TOPIC,
+        topic,
         payload,
         (int)len,
         1,
@@ -174,13 +179,13 @@ esp_err_t mqtt_publish_sensor_data(
     }
 
     if (msg_id < 0) {
-        ESP_LOGE(TAG, "Falha enfileirando publicacao");
+        ESP_LOGE(TAG, "Falha enfileirando publicacao em %s", topic);
         return ESP_FAIL;
     }
 
     ESP_LOGI(TAG,
              "Aguardando confirmacao: topico=%s msg_id=%d bytes=%u",
-             MQTT_STATE_TOPIC,
+             topic,
              msg_id,
              (unsigned)len);
 
@@ -205,4 +210,54 @@ esp_err_t mqtt_publish_sensor_data(
              msg_id,
              (unsigned long)timeout_ms);
     return ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t publish_serialized(
+    const char *topic,
+    const char *payload,
+    size_t len,
+    uint32_t timeout_ms,
+    int *out_msg_id)
+{
+    if (payload == NULL || len == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_mqtt_connected || s_mqtt_client == NULL ||
+        s_mqtt_events == NULL || s_publish_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Espera, no maximo, uma publicacao em andamento terminar. */
+    if (xSemaphoreTake(s_publish_mutex, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        ESP_LOGW(TAG, "Outra publicacao ocupou o MQTT por mais de %lu ms",
+                 (unsigned long)timeout_ms);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    const esp_err_t err =
+        publish_and_wait(topic, payload, len, timeout_ms, out_msg_id);
+
+    xSemaphoreGive(s_publish_mutex);
+    return err;
+}
+
+esp_err_t mqtt_publish_sensor_data(
+    const char *payload,
+    size_t len,
+    uint32_t timeout_ms,
+    int *out_msg_id)
+{
+    return publish_serialized(
+        MQTT_STATE_TOPIC, payload, len, timeout_ms, out_msg_id);
+}
+
+esp_err_t mqtt_publish_alert(
+    const char *payload,
+    size_t len,
+    uint32_t timeout_ms,
+    int *out_msg_id)
+{
+    return publish_serialized(
+        MQTT_ALERT_TOPIC, payload, len, timeout_ms, out_msg_id);
 }

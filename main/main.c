@@ -22,6 +22,7 @@
 #include "sleep_manager.h"
 #include "mqtt_handler.h"
 #include "audio_ml.h"
+#include "risk_alert.h"
 // Drivers de sensores (apenas para init)
 #include "dps310.h"
 #include "sgp41.h"
@@ -96,6 +97,12 @@ void app_main(void)
     // if (mic_ics43434_init() != ESP_OK) ESP_LOGE(TAG, "Falha ICS43434");
     // Inicializa o microfone e o pipeline de audio TinyML antes das demais tasks.
     // A task de audio permanece como a unica leitora do I2S.
+    // A task de alerta precisa existir antes da IA comecar a inferir.
+    ESP_LOGI(TAG, "Iniciando task de alerta de risco...");
+    if (risk_alert_start() != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao iniciar alerta de risco");
+    }
+
     ESP_LOGI(TAG, "Inicializando audio TinyML...");
     if (audio_ml_start() != ESP_OK) {
         ESP_LOGE(TAG, "Falha ao iniciar pipeline de audio TinyML");
@@ -112,4 +119,4 @@ void app_main(void)
     }
 
     ESP_LOGI(TAG, "Main finalizada (Tasks rodando).");
-}
+}

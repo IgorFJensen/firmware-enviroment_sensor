@@ -7,6 +7,7 @@ idf_component_register(
         "sensor_task.c"
         "stats_utils.c"
         "audio_ml.c"
+        "risk_alert.c"
     INCLUDE_DIRS "."
 
 )

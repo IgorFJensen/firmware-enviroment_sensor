@@ -23,6 +23,7 @@
 #include "audio_ml.h"
 
 #include "mqtt_handler.h"
+#include "risk_alert.h"
 #include "stats_utils.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
@@ -234,7 +235,9 @@ static void initialize_hardware(i2c_master_bus_handle_t bus_handle)
         bool conditioning_ok = true;
         for (int i = 0; i < 10; ++i) {
             uint16_t voc_raw = 0;
+            risk_alert_sensor_gate_enter();
             esp_err_t err = sgp41_execute_conditioning(h.humidity, t, &voc_raw);
+            risk_alert_sensor_gate_exit();
 
             if (err != ESP_OK) {
                 ESP_LOGW(TAG,
@@ -311,6 +314,12 @@ static void execute_short_burst(i2c_master_bus_handle_t bus_handle, int burst_in
     TickType_t next_sample_tick = xTaskGetTickCount();
 
     for (int s = 0; s < BURST_SAMPLES; ++s) {
+        /*
+         * Portao dos sensores: se a IA detectar risco, a task de alerta fecha
+         * o portao e esta leitura so comeca depois que o alerta for enviado.
+         */
+        risk_alert_sensor_gate_enter();
+
         const float current_db = read_microphone_db();
 
         const int dps_ret = dps310_read(&temp, &press);
@@ -352,6 +361,8 @@ static void execute_short_burst(i2c_master_bus_handle_t bus_handle, int burst_in
                          s_last_nox_index);
             }
         }
+
+        risk_alert_sensor_gate_exit();
 
         const int32_t local_voc = s_last_voc_index;
         const int32_t local_nox = s_last_nox_index;

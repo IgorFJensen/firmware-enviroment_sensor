@@ -25,6 +25,17 @@ esp_err_t mqtt_publish_sensor_data(
     uint32_t timeout_ms,
     int *out_msg_id);
 
+/**
+ * Publica um alerta em sensors/alert com QoS 1 e retain, aguardando a
+ * confirmacao do broker. As publicacoes sao serializadas: se as medias
+ * estiverem sendo enviadas, o alerta sai logo em seguida.
+ */
+esp_err_t mqtt_publish_alert(
+    const char *payload,
+    size_t len,
+    uint32_t timeout_ms,
+    int *out_msg_id);
+
 #ifdef __cplusplus
 }
 #endif

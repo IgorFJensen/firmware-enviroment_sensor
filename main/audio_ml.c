@@ -65,6 +65,15 @@ static volatile bool s_infer_paused = false;
 
 static bool s_led_risk_state = false;
 
+/* Contador de pausas: o audio so volta quando todas forem liberadas. */
+static portMUX_TYPE s_pause_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_pause_depth = 0;
+
+/* Aviso imediato de mudanca de risco (ver audio_ml_set_risk_callback). */
+static audio_ml_risk_callback_t s_risk_callback = NULL;
+static void *s_risk_callback_ctx = NULL;
+static bool s_last_notified_risk = false;
+
 static inline int16_t pcm24_to_pcm16(int32_t raw)
 {
     /*
@@ -221,6 +230,30 @@ static void risk_led_update(void)
             : "DESLIGADO");
 }
 
+/*
+ * Chamado logo depois de cada inferencia. Dispara o callback somente na
+ * borda (mudanca de estado), para o alerta ser enviado uma unica vez.
+ */
+static void notify_risk_change(void)
+{
+    tinyml_risk_status_t status = {0};
+
+    if (tinyml_runtime_get_status(&status) != ESP_OK) {
+        return;
+    }
+
+    if (status.risk_active == s_last_notified_risk) {
+        return;
+    }
+
+    s_last_notified_risk = status.risk_active;
+
+    const audio_ml_risk_callback_t callback = s_risk_callback;
+    if (callback != NULL) {
+        callback(status.risk_active, s_risk_callback_ctx);
+    }
+}
+
 static void audio_infer_task(void *arg)
 {
     (void)arg;
@@ -309,6 +342,13 @@ static void audio_infer_task(void *arg)
              * o estado temporal de risco.
              */
             risk_led_update();
+
+            /*
+             * Avisa imediatamente a task de alerta quando o estado muda.
+             * O callback apenas notifica; a inferencia continua sem esperar
+             * o envio MQTT.
+             */
+            notify_risk_change();
         }
 
         /*
@@ -617,6 +657,25 @@ esp_err_t audio_ml_start(void)
     return ESP_OK;
 }
 
+static void release_pause_ref(void)
+{
+    bool resumed = false;
+
+    portENTER_CRITICAL(&s_pause_mux);
+    if (s_pause_depth > 0U) {
+        --s_pause_depth;
+    }
+    if (s_pause_depth == 0U) {
+        s_pause_requested = false;
+        resumed = true;
+    }
+    portEXIT_CRITICAL(&s_pause_mux);
+
+    if (resumed) {
+        ESP_LOGI(TAG, "Captura I2S e inferencia liberadas");
+    }
+}
+
 esp_err_t audio_ml_pause(uint32_t timeout_ms)
 {
     if (s_capture_task_handle == NULL &&
@@ -624,7 +683,10 @@ esp_err_t audio_ml_pause(uint32_t timeout_ms)
         return ESP_OK;
     }
 
+    portENTER_CRITICAL(&s_pause_mux);
+    ++s_pause_depth;
     s_pause_requested = true;
+    portEXIT_CRITICAL(&s_pause_mux);
 
     const TickType_t start = xTaskGetTickCount();
     const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
@@ -641,7 +703,7 @@ esp_err_t audio_ml_pause(uint32_t timeout_ms)
         }
 
         if ((xTaskGetTickCount() - start) >= timeout_ticks) {
-            s_pause_requested = false;
+            release_pause_ref();
             ESP_LOGW(TAG, "Timeout pausando pipeline de audio");
             return ESP_ERR_TIMEOUT;
         }
@@ -652,8 +714,15 @@ esp_err_t audio_ml_pause(uint32_t timeout_ms)
 
 void audio_ml_resume(void)
 {
-    s_pause_requested = false;
-    ESP_LOGI(TAG, "Captura I2S e inferencia liberadas");
+    release_pause_ref();
+}
+
+void audio_ml_set_risk_callback(
+    audio_ml_risk_callback_t callback,
+    void *ctx)
+{
+    s_risk_callback_ctx = ctx;
+    s_risk_callback = callback;
 }
 
 float audio_ml_get_db(void)
