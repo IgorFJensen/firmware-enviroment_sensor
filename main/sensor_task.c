@@ -39,14 +39,14 @@ static const char *TAG = "SENSOR_TASK";
 #define MQTT_PRE_TX_QUIET_MS       100
 #define MQTT_POST_TX_GUARD_MS      250
 
-#define FLAG_TEMP_MIN_C            20.0f
-#define FLAG_TEMP_MAX_C            29.0f
-#define FLAG_HUMID_MIN_PCT         45.0f
-#define FLAG_HUMID_MAX_PCT         85.0f
-#define FLAG_DARK_LUX              10.0f
-#define FLAG_VOC_ELEVATED_INDEX    150.0f
-#define FLAG_NOX_ELEVATED_INDEX    10.0f
-#define FLAG_TEMP_VARIANCE_LIMIT   5.0f
+#define FLAG_TEMP_MIN_C            20.0f    // ANVISA RE n. 9/2003; OMS 2018 (frio)
+#define FLAG_TEMP_MAX_C            26.0f    // ANVISA RE n. 9/2003
+#define FLAG_HUMID_MIN_PCT         40.0f    // ANVISA RE n. 9/2003
+#define FLAG_HUMID_MAX_PCT         65.0f    // ANVISA RE n. 9/2003
+#define FLAG_DARK_LUX              10.0f    // empirico: medido com a luz do comodo apagada
+#define FLAG_VOC_ELEVATED_INDEX    150.0f   // Sensirion VOC Index (100 = media 24 h)
+#define FLAG_NOX_ELEVATED_INDEX    20.0f    // Sensirion NOx Index (1 = linha de base)
+#define FLAG_TEMP_VARIANCE_LIMIT   5.0f     // detecta picos bruscos de temperatura (C^2)
 
 #define CIRCULAR_SIZE 3
 #define BURST_CIRCULAR_SIZE 5
