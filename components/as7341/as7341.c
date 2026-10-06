@@ -71,6 +71,8 @@ static void as7341_dump_smux(void);
 #define AS7341_REG_ID           0x92
 
 #define AS7341_REG_CONTROL      0xFA
+#define AS7341_REG_CFG6         0xAF     /* bits 4:3 = SMUX_CMD */
+#define AS7341_SMUX_CMD_WRITE   (2 << 3) /* grava a config da RAM no SMUX */
 
 /* =========================================================
  * BITS
@@ -100,12 +102,14 @@ static const uint8_t smux_f1_f4[20] = {
     0x01, 0x50, 0x00, 0x06
 };
 
+/* F5 (ADC0), F6 (ADC1), F7 (ADC2), F8 (ADC3), CLEAR (ADC4), NIR (ADC5).
+ * A tabela anterior estava embaralhada (conferido com a Adafruit_AS7341). */
 static const uint8_t smux_f5_f8[20] = {
-    0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x50,
-    0x00, 0x30, 0x02, 0x00,
-    0x00, 0x00, 0x40, 0x02,
-    0x00, 0x00, 0x10, 0x03
+    0x00, 0x00, 0x00, 0x40,
+    0x02, 0x00, 0x10, 0x03,
+    0x50, 0x10, 0x03, 0x00,
+    0x00, 0x00, 0x24, 0x00,
+    0x00, 0x50, 0x00, 0x06
 };
 
 /* =========================================================
@@ -294,25 +298,17 @@ static void as7341_dump_smux(void)
 static esp_err_t as7341_load_smux(
     const uint8_t *config)
 {
-    /* Sem ESP_ERROR_CHECK: um NACK no I2C reiniciava o ESP32 inteiro. */
-    uint8_t cfg0;
-    esp_err_t err = as7341_read_reg(AS7341_REG_CFG0, &cfg0);
-    if (err != ESP_OK) return err;
-
-    /* BANK = 1 */
-    err = as7341_write_reg(AS7341_REG_CFG0, cfg0 | AS7341_CFG0_BANK);
-    if (err != ESP_OK) return err;
-    vTaskDelay(pdMS_TO_TICKS(1));
-
+    /*
+     * A RAM do SMUX (0x00-0x13) e escrita direto, sem troca de banco
+     * (igual a Adafruit_AS7341). A versao anterior alternava o bit 6 do
+     * CFG0, que nao e o REG_BANK (bit 4).
+     * Sem ESP_ERROR_CHECK: um NACK no I2C reiniciava o ESP32 inteiro.
+     */
     for (int i = 0; i < 20; i++) {
-        err = as7341_write_reg(i, config[i]);
-        if (err != ESP_OK) break;
+        esp_err_t err = as7341_write_reg((uint8_t)i, config[i]);
+        if (err != ESP_OK) return err;
     }
-
-    /* BANK = 0 (sempre tenta voltar) */
-    esp_err_t err2 = as7341_write_reg(AS7341_REG_CFG0, cfg0 & ~AS7341_CFG0_BANK);
-    vTaskDelay(pdMS_TO_TICKS(1));
-    return (err != ESP_OK) ? err : err2;
+    return ESP_OK;
 }
 
 /* =========================================================
@@ -331,11 +327,15 @@ static esp_err_t as7341_start_measurement(
     /* Load SMUX na RAM */
     AS_TRY(as7341_load_smux(smux));
 
-    /* 1. Ativa o bit SMUXEN primeiro */
+    /*
+     * Diz ao SMUX para usar a configuracao recem-escrita (CFG6.SMUX_CMD=2)
+     * e entao dispara com SMUXEN. Antes o comando era escrito no registrador
+     * CONTROL (0xFA), que nao tem essa funcao: o SMUX ficava sempre na
+     * configuracao padrao de fabrica e as duas leituras (F1-F4 e F5-F8)
+     * saiam iguais.
+     */
+    AS_TRY(as7341_write_reg(AS7341_REG_CFG6, AS7341_SMUX_CMD_WRITE));
     AS_TRY(as7341_set_enable(true, false, true));
-
-    /* 2. Comando de Apply SMUX */
-    AS_TRY(as7341_write_reg(AS7341_REG_CONTROL, AS7341_CONTROL_SMUX_CMD));
 
     /* Wait SMUX (vai esperar o SMUXEN voltar a 0) */
     esp_err_t ret = as7341_wait_smux();
@@ -347,9 +347,6 @@ static esp_err_t as7341_start_measurement(
     /* Start spectral measurement */
     AS_TRY(as7341_set_enable(true, true, false));
     vTaskDelay(pdMS_TO_TICKS(1));
-
-    /* Kick ADC conversion */
-    AS_TRY(as7341_write_reg(AS7341_REG_CONTROL, AS7341_CONTROL_ADC_INIT));
 
     /* Integracao ~83 ms (ATIME=29, ASTEP=999); o restante e coberto por wait_data */
     vTaskDelay(pdMS_TO_TICKS(50));
