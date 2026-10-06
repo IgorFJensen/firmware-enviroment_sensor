@@ -1,4 +1,16 @@
-/* main/sensor_task.c */
+/* main/sensor_task.c
+ * Made by Igor Jensen - UFES - LAEEC
+ *
+ * Revisao out/2026:
+ *   - temperatura principal agora vem do SHT40 (+-0.2 C) em vez do DPS368
+ *     (+-0.5 C); o DPS368 continua sendo lido e aparece como "T_dps"
+ *   - correcao de offset de temperatura (TEMP_OFFSET_C) com recalculo da UR
+ *   - limites unificados em env_limits.h: terminal e MQTT usam as MESMAS flags
+ *   - leituras com falha nao entram mais como 0 nas medias
+ *   - flags de VOC/NOx so valem depois do aquecimento do algoritmo Sensirion
+ *   - Gas Index atualizado a cada 1.0 s de fato (antes oscilava entre 1 e 1.5 s)
+ *   - saida do terminal reorganizada
+ */
 #include "sensor_task.h"
 #include <stdio.h>
 #include <stdbool.h>
@@ -25,6 +37,7 @@
 #include "mqtt_handler.h"
 #include "risk_alert.h"
 #include "stats_utils.h"
+#include "env_limits.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
 
@@ -32,25 +45,49 @@ static const char *TAG = "SENSOR_TASK";
 
 #define SENSOR_TASK_STACK_SIZE 10240
 #define SENSOR_TASK_PRIORITY   4
-#define SENSOR_PWR_PIN         19  
-#define MQTT_PAYLOAD_MAX_LEN       1024
+#define SENSOR_PWR_PIN         19
+#define MQTT_PAYLOAD_MAX_LEN       1280
 #define MQTT_PUBLISH_TIMEOUT_MS    5000
 #define AUDIO_PAUSE_TIMEOUT_MS     1500
 #define MQTT_PRE_TX_QUIET_MS       100
 #define MQTT_POST_TX_GUARD_MS      250
 
-#define FLAG_TEMP_MIN_C            20.0f    // ANVISA RE n. 9/2003; OMS 2018 (frio)
-#define FLAG_TEMP_MAX_C            26.0f    // ANVISA RE n. 9/2003
-#define FLAG_HUMID_MIN_PCT         40.0f    // ANVISA RE n. 9/2003
-#define FLAG_HUMID_MAX_PCT         65.0f    // ANVISA RE n. 9/2003
-#define FLAG_DARK_LUX              10.0f    // empirico: medido com a luz do comodo apagada
-#define FLAG_VOC_ELEVATED_INDEX    150.0f   // Sensirion VOC Index (100 = media 24 h)
-#define FLAG_NOX_ELEVATED_INDEX    20.0f    // Sensirion NOx Index (1 = linha de base)
-#define FLAG_TEMP_VARIANCE_LIMIT   5.0f     // detecta picos bruscos de temperatura (C^2)
+#define BASE_REPEAT                5        /* bursts por ciclo longo        */
+#define SAMPLE_INTERVAL_MS         500
+#define BURST_DURATION_MS          10000
+#define BURST_SAMPLES              (BURST_DURATION_MS / SAMPLE_INTERVAL_MS)
+
+/* Gas Index: periodo nominal 1 s. Com amostragem a cada 500 ms, um limiar
+ * de exatamente 1.000 s fazia o update cair as vezes para 1.5 s (jitter). */
+#define SGP_UPDATE_MIN_US          950000LL
+
+/* AS7341: ATIME=29, ASTEP=999 -> fundo de escala (29+1)*(999+1) = 30000 */
+#define AS7341_FULL_SCALE          30000.0f
 
 #define CIRCULAR_SIZE 3
 #define BURST_CIRCULAR_SIZE 5
-const float INVALID_F = -9999.0f;
+static const float INVALID_F = -9999.0f;
+
+/* ----------------------------- terminal ----------------------------- */
+#if TERM_USE_COLOR
+  #define C_RST  "\033[0m"
+  #define C_DIM  "\033[2m"
+  #define C_BLD  "\033[1m"
+  #define C_RED  "\033[31m"
+  #define C_GRN  "\033[32m"
+  #define C_YEL  "\033[33m"
+  #define C_CYN  "\033[36m"
+#else
+  #define C_RST  ""
+  #define C_DIM  ""
+  #define C_BLD  ""
+  #define C_RED  ""
+  #define C_GRN  ""
+  #define C_YEL  ""
+  #define C_CYN  ""
+#endif
+#define LINE_EQ "=============================================================================="
+#define LINE_DS "------------------------------------------------------------------------------"
 
 // --- DATA STRUCTURES ---
 
@@ -67,8 +104,11 @@ typedef struct {
 } longa_t;
 
 typedef struct {
-    float temp;
-    float humid;
+    float temp;            /* SHT40 corrigido (TEMP_OFFSET_C)            */
+    float humid;           /* SHT40 recalculada p/ a temperatura corrigida */
+    float temp_raw;        /* SHT40 sem correcao                          */
+    float humid_raw;
+    float temp_dps;        /* temperatura interna do DPS368                */
     float press;
     float lux;
     float mic_db;
@@ -77,12 +117,33 @@ typedef struct {
     float temp_variance;
     float humidity_variance;
     float f1, f2, f3, f4, f5, f6, f7, f8, clear, nir;
+    uint8_t n_sht, n_dps, n_veml, n_as;   /* amostras validas no burst */
+    bool as_saturated;
+    bool veml_saturated;
     uint32_t timestamp;
 } burst_hist_t;
 
+/* Flags calculadas UMA vez e usadas no terminal e no MQTT */
+typedef struct {
+    bool temp_valid, humid_valid, press_valid, lux_valid;
+    bool measurement_valid;     /* todos os 4 acima (compatibilidade MQTT) */
+    bool gas_ready;
+    bool audio_valid;
+    audio_ml_risk_status_t audio;
+    float temp_stddev_hist;     /* desvio padrao entre os ultimos bursts */
+    bool temp_low, temp_high, temp_out_of_range;
+    bool temp_variation;
+    bool humid_low, humid_high, humidity_out_of_range;
+    bool dark;
+    bool voc_elevated;
+    bool nox_elevated;
+    bool audio_risk;
+    bool critical;
+} env_flags_t;
+
 // --- GLOBAL STATIC BUFFERS ---
 
-static longa_t longa_buffer[10];
+static longa_t longa_buffer[CIRCULAR_SIZE];
 static int buffer_head = 0;
 static int buffer_count = 0;
 
@@ -96,19 +157,81 @@ static bool s_sgp41_conditioned = false;
 static int32_t s_last_voc_index = 100;
 static int32_t s_last_nox_index = 1;
 static int64_t s_last_sgp_update_us = 0;
+static int64_t s_first_sgp_index_us = 0;
+static uint32_t s_sgp_ok_count = 0;
 static uint32_t s_mqtt_cycle_number = 0;
 
 // --- FORWARD DECLARATIONS ---
 
 static void initialize_hardware(i2c_master_bus_handle_t bus_handle);
-static void execute_hardware_reinit(i2c_master_bus_handle_t bus_handle);
+static void execute_hardware_reinit(i2c_master_bus_handle_t bus_handle) __attribute__((unused));
 static float read_microphone_db(void);
-static void execute_short_burst(i2c_master_bus_handle_t bus_handle, int burst_index, int total_repeats, burst_hist_t *out_burst_mean);
+static void execute_short_burst(int burst_index, int total_repeats, burst_hist_t *out_burst_mean);
 static void push_burst_to_history(const burst_hist_t *new_burst);
-static void print_burst_history(void);
-static void publish_burst_mean(const burst_hist_t *mean, int burst_index, int total_bursts);
-static void process_long_cycle(float temp_sum, float hum_sum, float press_sum, float lux_sum, float mic_sum, float voc_sum, float nox_sum, float *spectral_sums);
-static void execute_light_sleep(void);
+static void evaluate_flags(const burst_hist_t *mean, env_flags_t *f);
+static void print_burst_report(const burst_hist_t *mean, const env_flags_t *f, int burst_index, int total_bursts);
+static void publish_burst_mean(const burst_hist_t *mean, const env_flags_t *f, int burst_index, int total_bursts);
+static void process_long_cycle(const float *sums);
+static void execute_light_sleep(void) __attribute__((unused));
+
+// --- HELPERS ---
+
+static float mean_or_invalid(const float *data, size_t n)
+{
+    return (stats_count_valid_f(data, n, INVALID_F) > 0)
+               ? stats_mean_f(data, n, INVALID_F)
+               : INVALID_F;
+}
+
+static inline bool is_valid(float v) { return v != INVALID_F; }
+
+/* Pressao de vapor de saturacao (Magnus, hPa) */
+static float magnus_es(float t_c)
+{
+    return 6.112f * expf((17.62f * t_c) / (243.12f + t_c));
+}
+
+/*
+ * Aplica o offset de temperatura e recalcula a UR mantendo a mesma
+ * quantidade de vapor (pressao de vapor constante).
+ */
+static void apply_temp_calibration(float t_raw, float rh_raw, float *t_out, float *rh_out)
+{
+    const float t_corr = t_raw - TEMP_OFFSET_C;
+    float rh_corr = rh_raw;
+    if (TEMP_OFFSET_C != 0.0f) {
+        rh_corr = rh_raw * magnus_es(t_raw) / magnus_es(t_corr);
+        if (rh_corr > 100.0f) rh_corr = 100.0f;
+        if (rh_corr < 0.0f) rh_corr = 0.0f;
+    }
+    *t_out = t_corr;
+    *rh_out = rh_corr;
+}
+
+static const char *fmt_val(char *buf, size_t sz, float v, const char *fmt)
+{
+    if (!is_valid(v)) {
+        snprintf(buf, sz, "  ---");
+    } else {
+        snprintf(buf, sz, fmt, v);
+    }
+    return buf;
+}
+
+static const char *tag_ok(bool bad, bool valid, const char *bad_txt)
+{
+    static char out[4][48];
+    static int k = 0;
+    k = (k + 1) & 3;
+    if (!valid) {
+        snprintf(out[k], sizeof(out[k]), C_DIM "[ sem dado ]" C_RST);
+    } else if (bad) {
+        snprintf(out[k], sizeof(out[k]), C_RED C_BLD "[ %s ]" C_RST, bad_txt);
+    } else {
+        snprintf(out[k], sizeof(out[k]), C_GRN "[ OK ]" C_RST);
+    }
+    return out[k];
+}
 
 // --- MAIN TASK LOOP ---
 
@@ -120,58 +243,45 @@ static void sensor_loop_task(void *pvParameters)
     initialize_hardware(bus_handle);
 
     while (1) {
-        float longa_temp_sum = 0.0f, longa_hum_sum = 0.0f, longa_press_sum = 0.0f;
-        float longa_lux_sum = 0.0f, longa_mic_db_sum = 0.0f;
-        float longa_voc_sum = 0.0f, longa_nox_sum = 0.0f;
-        float longa_spectral_sums[10] = {0.0f}; // f1-f8, clear, nir
-
-        const int BASE_REPEAT = 5;              
+        /* temp, humid, press, lux, mic, voc, nox, f1..f8, clear, nir */
+        float sums[17] = {0};
+        int   counts[17] = {0};
 
         for (int base_i = 0; base_i < BASE_REPEAT; ++base_i) {
-            burst_hist_t current_burst_mean;
-            
-            // 1. Acquire and process the short 10s burst frame
-            execute_short_burst(bus_handle, base_i + 1, BASE_REPEAT, &current_burst_mean);
+            burst_hist_t m;
+            env_flags_t flags;
 
-            // 2. Commit burst mean data to historical circular buffer and render logs
-            push_burst_to_history(&current_burst_mean);
-            print_burst_history();
+            // 1. 10 s de amostragem
+            execute_short_burst(base_i + 1, BASE_REPEAT, &m);
+
+            // 2. Historico + flags (mesmas para terminal e MQTT)
+            push_burst_to_history(&m);
+            evaluate_flags(&m, &flags);
+            print_burst_report(&m, &flags, base_i + 1, BASE_REPEAT);
 
             /*
              * Todas as 20 leituras deste burst ja terminaram. A task de
              * sensores fica bloqueada aqui ate o QoS 1 ser confirmado, de
              * forma que nenhuma nova transacao I2C comece durante o envio.
              */
-            publish_burst_mean(&current_burst_mean, base_i + 1, BASE_REPEAT);
+            publish_burst_mean(&m, &flags, base_i + 1, BASE_REPEAT);
 
-            // 3. Accumulate metrics for the upcoming long cycle processing stage
-            longa_temp_sum   += current_burst_mean.temp;
-            longa_hum_sum    += current_burst_mean.humid;
-            longa_press_sum  += current_burst_mean.press;
-            longa_lux_sum    += current_burst_mean.lux;
-            longa_mic_db_sum += current_burst_mean.mic_db;
-            longa_voc_sum    += current_burst_mean.voc;
-            longa_nox_sum    += current_burst_mean.nox;
-            
-            longa_spectral_sums[0] += current_burst_mean.f1;
-            longa_spectral_sums[1] += current_burst_mean.f2;
-            longa_spectral_sums[2] += current_burst_mean.f3;
-            longa_spectral_sums[3] += current_burst_mean.f4;
-            longa_spectral_sums[4] += current_burst_mean.f5;
-            longa_spectral_sums[5] += current_burst_mean.f6;
-            longa_spectral_sums[6] += current_burst_mean.f7;
-            longa_spectral_sums[7] += current_burst_mean.f8;
-            longa_spectral_sums[8] += current_burst_mean.clear;
-            longa_spectral_sums[9] += current_burst_mean.nir;
+            // 3. Acumula para o ciclo longo (ignorando bursts sem dado)
+            const float v[17] = {m.temp, m.humid, m.press, m.lux, m.mic_db, m.voc, m.nox,
+                                 m.f1, m.f2, m.f3, m.f4, m.f5, m.f6, m.f7, m.f8, m.clear, m.nir};
+            for (int i = 0; i < 17; ++i) {
+                if (is_valid(v[i])) { sums[i] += v[i]; counts[i]++; }
+            }
 
-            // 4. Suspend operations using Light Sleep mode
-           // execute_light_sleep();
-           // execute_hardware_reinit(bus_handle);
-        } 
+            // 4. Light sleep (desativado)
+            // execute_light_sleep();
+            // execute_hardware_reinit(bus_handle);
+        }
 
-        // --- END OF MAIN REPEAT LOOP: PROCESS LONG CYCLE ---
-        process_long_cycle(longa_temp_sum, longa_hum_sum, longa_press_sum, longa_lux_sum, 
-                           longa_mic_db_sum, longa_voc_sum, longa_nox_sum, longa_spectral_sums);
+        for (int i = 0; i < 17; ++i) {
+            sums[i] = (counts[i] > 0) ? sums[i] / (float)counts[i] : INVALID_F;
+        }
+        process_long_cycle(sums);
     }
 }
 
@@ -186,33 +296,30 @@ static void initialize_hardware(i2c_master_bus_handle_t bus_handle)
     gpio_sleep_sel_dis(SENSOR_PWR_PIN);
 #endif
 
-    printf("\n> Powering VCC (GPIO %d) permanently and initializing drivers...\n",
-           SENSOR_PWR_PIN);
+    printf("\n" C_CYN LINE_EQ "\n"
+           "  EnvSens - inicializando sensores (VCC no GPIO %d)\n"
+           "  Norma: %s | T %.0f-%.0f C | UR %.0f-%.0f %% | offset T %.2f C\n"
+           LINE_EQ C_RST "\n",
+           SENSOR_PWR_PIN, ENV_NORM_NAME,
+           FLAG_TEMP_MIN_C, FLAG_TEMP_MAX_C, FLAG_HUMID_MIN_PCT, FLAG_HUMID_MAX_PCT,
+           TEMP_OFFSET_C);
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    if (dps310_init(bus_handle) != ESP_OK) {
-        ESP_LOGE(TAG, "Falha DPS310");
-    }
-
+    const bool dps_ok = (dps310_init(bus_handle) == ESP_OK);
     s_sgp41_ready = (sgp41_init(bus_handle) == ESP_OK);
-    if (!s_sgp41_ready) {
-        ESP_LOGE(TAG, "Falha SGP41");
-    }
+    const bool veml_ok = (veml7700_init(bus_handle) == ESP_OK);
+    const bool as_ok = (as7341_init(bus_handle) == ESP_OK);
+    const bool sht_ok = (sht40_init(bus_handle) == ESP_OK);
 
-    if (veml7700_init(bus_handle) != ESP_OK) {
-        ESP_LOGE(TAG, "Falha VEML7700");
-    }
+    printf("  Sensores: SHT40 %s | DPS368 %s | SGP41 %s | VEML7700 %s | AS7341 %s\n",
+           sht_ok ? C_GRN "OK" C_RST : C_RED "FALHA" C_RST,
+           dps_ok ? C_GRN "OK" C_RST : C_RED "FALHA" C_RST,
+           s_sgp41_ready ? C_GRN "OK" C_RST : C_RED "FALHA" C_RST,
+           veml_ok ? C_GRN "OK" C_RST : C_RED "FALHA" C_RST,
+           as_ok ? C_GRN "OK" C_RST : C_RED "FALHA" C_RST);
 
-    if (as7341_init(bus_handle) != ESP_OK) {
-        ESP_LOGE(TAG, "Falha AS7341");
-    }
-
-    if (sht40_init(bus_handle) != ESP_OK) {
-        ESP_LOGE(TAG, "Falha SHT40");
-    }
-
-    float t = 25.0f;
+    float t_dps = 25.0f;
     float p = 0.0f;
     uint16_t als_raw = 0;
     sht40_reading_t h = {
@@ -221,30 +328,33 @@ static void initialize_hardware(i2c_master_bus_handle_t bus_handle)
     };
 
     vTaskDelay(pdMS_TO_TICKS(100));
-    dps310_read(&t, &p);
-    sht40_read_data(&h);
+    dps310_read(&t_dps, &p);
+    const bool sht_first_ok = (sht40_read_data(&h) == ESP_OK);
     veml7700_read_als(&als_raw);
 
     /*
      * O NOx do SGP41 precisa de aproximadamente 10 s de conditioning.
      * Como GPIO19 permanece ligado, fazemos essa etapa uma unica vez.
+     * Compensacao usa T/UR do SHT40 (recomendacao Sensirion).
      */
     if (s_sgp41_ready && !s_sgp41_conditioned) {
-        ESP_LOGI(TAG, "SGP41: iniciando conditioning de 10 s...");
+        printf("  SGP41: conditioning de 10 s ");
 
         bool conditioning_ok = true;
         for (int i = 0; i < 10; ++i) {
             uint16_t voc_raw = 0;
             risk_alert_sensor_gate_enter();
-            esp_err_t err = sgp41_execute_conditioning(h.humidity, t, &voc_raw);
+            esp_err_t err = sgp41_execute_conditioning(
+                sht_first_ok ? h.humidity : 50.0f,
+                sht_first_ok ? h.temperature : 25.0f,
+                &voc_raw);
             risk_alert_sensor_gate_exit();
 
             if (err != ESP_OK) {
-                ESP_LOGW(TAG,
-                         "SGP41 conditioning %d/10 falhou: %s",
-                         i + 1,
-                         esp_err_to_name(err));
                 conditioning_ok = false;
+                printf(C_RED "x" C_RST);
+            } else {
+                printf(".");
             }
 
             // execute_conditioning consome aproximadamente 50 ms.
@@ -252,12 +362,14 @@ static void initialize_hardware(i2c_master_bus_handle_t bus_handle)
         }
 
         s_sgp41_conditioned = conditioning_ok;
-        ESP_LOGI(TAG,
-                 "SGP41 conditioning finalizado: %s",
-                 conditioning_ok ? "OK" : "com falhas; operacao continuara com retry");
+        printf(" %s\n", conditioning_ok ? C_GRN "OK" C_RST
+                                        : C_YEL "com falhas (segue com retry)" C_RST);
     }
 
     s_last_sgp_update_us = 0;
+    s_first_sgp_index_us = 0;
+    s_sgp_ok_count = 0;
+    printf(C_CYN LINE_EQ C_RST "\n");
     vTaskDelay(pdMS_TO_TICKS(100));
 }
 
@@ -286,34 +398,40 @@ static float read_microphone_db(void)
     return audio_ml_get_db();
 }
 
-static void execute_short_burst(i2c_master_bus_handle_t bus_handle, int burst_index, int total_repeats, burst_hist_t *out_burst_mean)
+static bool gas_index_ready(void)
 {
-    (void)bus_handle;
+    if (!s_sgp41_ready || s_first_sgp_index_us == 0) return false;
+    /* Conditioning com falha nao bloqueia para sempre: depois de 10
+     * leituras boas consideramos o sensor operando. */
+    if (!s_sgp41_conditioned && s_sgp_ok_count < 10) return false;
+    return (esp_timer_get_time() - s_first_sgp_index_us) >= (int64_t)GAS_INDEX_WARMUP_S * 1000000LL;
+}
 
-    const int SAMPLE_INTERVAL_MS = 500;
-    const int BURST_DURATION_MS = 10000;
-    const int BURST_SAMPLES = BURST_DURATION_MS / SAMPLE_INTERVAL_MS;
+static void execute_short_burst(int burst_index, int total_repeats, burst_hist_t *out)
+{
+    float b_temp[BURST_SAMPLES], b_hum[BURST_SAMPLES];
+    float b_temp_raw[BURST_SAMPLES], b_hum_raw[BURST_SAMPLES], b_temp_dps[BURST_SAMPLES];
+    float b_press[BURST_SAMPLES], b_mic[BURST_SAMPLES], b_lux[BURST_SAMPLES];
+    float b_voc[BURST_SAMPLES], b_nox[BURST_SAMPLES];
+    float b_f[10][BURST_SAMPLES];   /* f1..f8, clear, nir */
 
-    float burst_temps[BURST_SAMPLES], burst_humids[BURST_SAMPLES], burst_press[BURST_SAMPLES], burst_mic[BURST_SAMPLES];
-    float burst_voc[BURST_SAMPLES], burst_nox[BURST_SAMPLES];
-    float burst_lux[BURST_SAMPLES];
+    bool as_sat = false, veml_sat = false;
 
-    float burst_f1[BURST_SAMPLES], burst_f2[BURST_SAMPLES], burst_f3[BURST_SAMPLES], burst_f4[BURST_SAMPLES];
-    float burst_f5[BURST_SAMPLES], burst_f6[BURST_SAMPLES], burst_f7[BURST_SAMPLES], burst_f8[BURST_SAMPLES];
-    float burst_clear[BURST_SAMPLES], burst_nir[BURST_SAMPLES];
-
-    float temp = 0.0f, press = 0.0f;
-    uint16_t als_raw = 0;
-    sht40_reading_t humid = {0};
-    as7341_spectral_data_t spectral_data = {0};
-
-    printf("\n--- SHORT BURST %02d/%02d (10s collection) ---\n", burst_index, total_repeats);
-    printf(" Amo | T(°C) | U(%%) | P(Pa)    | Lux     | Mic(dB) | VOC | NOx | F1-F4           | F5-F8           | CLR / NIR \n");
-    printf("-----+-------+-------+----------+---------+---------+-----+-----+-----------------+-----------------+-----------\n");
+    printf("\n" C_BLD "BURST %d/%d" C_RST C_DIM "  (20 amostras, 10 s)" C_RST "\n",
+           burst_index, total_repeats);
+#if TERM_PRINT_EACH_SAMPLE
+    printf(C_DIM "  #  | T(C)  | UR(%%) | T_dps | P(hPa)  |  Lux    | dB   | VOC | NOx | CLR    NIR%s" C_RST "\n",
+           TERM_PRINT_SPECTRAL_SAMPLE ? "  | F1..F8" : "");
+#endif
 
     TickType_t next_sample_tick = xTaskGetTickCount();
 
     for (int s = 0; s < BURST_SAMPLES; ++s) {
+        float t_dps = 0.0f, press = 0.0f;
+        uint16_t als_raw = 0;
+        sht40_reading_t sht = {0};
+        as7341_spectral_data_t sp = {0};
+
         /*
          * Portao dos sensores: se a IA detectar risco, a task de alerta fecha
          * o portao e esta leitura so comeca depois que o alerta for enviado.
@@ -322,185 +440,290 @@ static void execute_short_burst(i2c_master_bus_handle_t bus_handle, int burst_in
 
         const float current_db = read_microphone_db();
 
-        const int dps_ret = dps310_read(&temp, &press);
-        const int veml_ret = veml7700_read_als(&als_raw);
-        const int sht_ret = sht40_read_data(&humid);
-        const int as_ret = as7341_read_all_channels(&spectral_data);
+        const esp_err_t dps_ret = dps310_read(&t_dps, &press);
+        const esp_err_t veml_ret = veml7700_read_als(&als_raw);
+        const esp_err_t sht_ret = sht40_read_data(&sht);
+        const esp_err_t as_ret = as7341_read_all_channels(&sp);
 
         /*
          * Os demais sensores continuam em 2 Hz.
-         * O SGP41/Gas Index e atualizado somente a cada >= 1 s.
+         * O SGP41/Gas Index e atualizado a cada ~1 s.
          */
         const int64_t now_us = esp_timer_get_time();
         if (s_sgp41_ready &&
             (s_last_sgp_update_us == 0 ||
-             (now_us - s_last_sgp_update_us) >= 1000000LL)) {
+             (now_us - s_last_sgp_update_us) >= SGP_UPDATE_MIN_US)) {
 
-            const float compensation_h =
-                (sht_ret == ESP_OK) ? humid.humidity : 50.0f;
-            const float compensation_t =
-                (dps_ret == ESP_OK) ? temp : 25.0f;
+            /* Compensacao com os valores LOCAIS do SHT40 (sem offset):
+             * e o ar em volta do SGP41 que importa. */
+            const float comp_h = (sht_ret == ESP_OK) ? sht.humidity : 50.0f;
+            const float comp_t = (sht_ret == ESP_OK) ? sht.temperature
+                               : (dps_ret == ESP_OK) ? t_dps : 25.0f;
 
             int32_t voc = s_last_voc_index;
             int32_t nox = s_last_nox_index;
 
-            esp_err_t sgp_err = sgp41_get_indices(
-                compensation_h,
-                compensation_t,
-                &voc,
-                &nox);
+            const esp_err_t sgp_err = sgp41_get_indices(comp_h, comp_t, &voc, &nox);
 
             if (sgp_err == ESP_OK) {
                 s_last_voc_index = voc;
                 s_last_nox_index = nox;
                 s_last_sgp_update_us = now_us;
+                if (s_first_sgp_index_us == 0) s_first_sgp_index_us = now_us;
+                s_sgp_ok_count++;
             } else {
-                ESP_LOGW(TAG,
-                         "SGP41 update falhou; mantendo ultimo indice VOC=%" PRId32 " NOx=%" PRId32,
-                         s_last_voc_index,
-                         s_last_nox_index);
+                ESP_LOGW(TAG, "SGP41 falhou; mantendo VOC=%" PRId32 " NOx=%" PRId32,
+                         s_last_voc_index, s_last_nox_index);
             }
         }
 
         risk_alert_sensor_gate_exit();
 
-        const int32_t local_voc = s_last_voc_index;
-        const int32_t local_nox = s_last_nox_index;
+        if (sht_ret == ESP_OK) {
+            b_temp_raw[s] = sht.temperature;
+            b_hum_raw[s]  = sht.humidity;
+            apply_temp_calibration(sht.temperature, sht.humidity, &b_temp[s], &b_hum[s]);
+        } else {
+            b_temp_raw[s] = b_hum_raw[s] = b_temp[s] = b_hum[s] = INVALID_F;
+        }
+        b_temp_dps[s] = (dps_ret == ESP_OK) ? t_dps : INVALID_F;
+        b_press[s]    = (dps_ret == ESP_OK) ? press : INVALID_F;
+        b_lux[s]      = (veml_ret == ESP_OK) ? veml7700_raw_to_lux(als_raw) : INVALID_F;
+        if (veml_ret == ESP_OK && als_raw >= 65535) veml_sat = true;
+        b_mic[s]      = current_db;
+        b_voc[s]      = (float)s_last_voc_index;
+        b_nox[s]      = (float)s_last_nox_index;
 
-        burst_temps[s]  = (dps_ret == ESP_OK) ? temp : INVALID_F;
-        burst_humids[s] = (sht_ret == ESP_OK) ? humid.humidity : INVALID_F;
-        burst_press[s]  = (dps_ret == ESP_OK) ? press : INVALID_F;
-        burst_lux[s]    = (veml_ret == ESP_OK) ? veml7700_raw_to_lux(als_raw) : INVALID_F;
-        burst_mic[s]    = current_db;
-        burst_voc[s]    = (float)local_voc;
-        burst_nox[s]    = (float)local_nox;
+        const uint16_t spv[10] = {sp.f1, sp.f2, sp.f3, sp.f4, sp.f5, sp.f6, sp.f7, sp.f8, sp.clear, sp.nir};
+        for (int c = 0; c < 10; ++c) {
+            b_f[c][s] = (as_ret == ESP_OK) ? (float)spv[c] : INVALID_F;
+            if (as_ret == ESP_OK && (float)spv[c] >= AS7341_FULL_SCALE) as_sat = true;
+        }
 
-        burst_f1[s] = (as_ret == ESP_OK) ? (float)spectral_data.f1 : 0.0f;
-        burst_f2[s] = (as_ret == ESP_OK) ? (float)spectral_data.f2 : 0.0f;
-        burst_f3[s] = (as_ret == ESP_OK) ? (float)spectral_data.f3 : 0.0f;
-        burst_f4[s] = (as_ret == ESP_OK) ? (float)spectral_data.f4 : 0.0f;
-        burst_f5[s] = (as_ret == ESP_OK) ? (float)spectral_data.f5 : 0.0f;
-        burst_f6[s] = (as_ret == ESP_OK) ? (float)spectral_data.f6 : 0.0f;
-        burst_f7[s] = (as_ret == ESP_OK) ? (float)spectral_data.f7 : 0.0f;
-        burst_f8[s] = (as_ret == ESP_OK) ? (float)spectral_data.f8 : 0.0f;
-        burst_clear[s] = (as_ret == ESP_OK) ? (float)spectral_data.clear : 0.0f;
-        burst_nir[s]   = (as_ret == ESP_OK) ? (float)spectral_data.nir : 0.0f;
-
-        printf(" %02d  | %5.2f | %5.2f | %8.2f | %7.2f | %7.2f | %3" PRId32 " | %3" PRId32 " | %.0f %.0f %.0f %.0f | %.0f %.0f %.0f %.0f | %.0f / %.0f\n",
+#if TERM_PRINT_EACH_SAMPLE
+        char a[12], b[12], c[12], d[12], e[12];
+        printf("  %02d | %5s | %5s | %5s | %7s | %7s | %4.1f | %3" PRId32 " | %3" PRId32 " | %5.0f %5.0f",
                s + 1,
-               burst_temps[s],
-               burst_humids[s],
-               burst_press[s],
-               burst_lux[s],
-               burst_mic[s],
-               local_voc,
-               local_nox,
-               burst_f1[s], burst_f2[s], burst_f3[s], burst_f4[s],
-               burst_f5[s], burst_f6[s], burst_f7[s], burst_f8[s],
-               burst_clear[s], burst_nir[s]);
+               fmt_val(a, sizeof a, b_temp[s], "%5.2f"),
+               fmt_val(b, sizeof b, b_hum[s], "%5.1f"),
+               fmt_val(c, sizeof c, b_temp_dps[s], "%5.2f"),
+               fmt_val(d, sizeof d, is_valid(b_press[s]) ? b_press[s] / 100.0f : INVALID_F, "%7.2f"),
+               fmt_val(e, sizeof e, b_lux[s], "%7.1f"),
+               current_db, s_last_voc_index, s_last_nox_index,
+               is_valid(b_f[8][s]) ? b_f[8][s] : 0.0f,
+               is_valid(b_f[9][s]) ? b_f[9][s] : 0.0f);
+#if TERM_PRINT_SPECTRAL_SAMPLE
+        printf("  | %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f",
+               b_f[0][s], b_f[1][s], b_f[2][s], b_f[3][s], b_f[4][s], b_f[5][s], b_f[6][s], b_f[7][s]);
+#endif
+        printf("\n");
+#endif
 
         vTaskDelayUntil(&next_sample_tick, pdMS_TO_TICKS(SAMPLE_INTERVAL_MS));
     }
 
-    out_burst_mean->temp   = stats_mean_f(burst_temps, BURST_SAMPLES, INVALID_F);
-    out_burst_mean->humid  = stats_mean_f(burst_humids, BURST_SAMPLES, INVALID_F);
-    out_burst_mean->press  = stats_mean_f(burst_press, BURST_SAMPLES, INVALID_F);
-    out_burst_mean->lux    = stats_mean_f(burst_lux, BURST_SAMPLES, INVALID_F);
-    out_burst_mean->mic_db = stats_mean_f(burst_mic, BURST_SAMPLES, 0.0f);
-    out_burst_mean->voc    = stats_mean_f(burst_voc, BURST_SAMPLES, 0.0f);
-    out_burst_mean->nox    = stats_mean_f(burst_nox, BURST_SAMPLES, 0.0f);
-    out_burst_mean->f1     = stats_mean_f(burst_f1, BURST_SAMPLES, 0.0f);
-    out_burst_mean->f2     = stats_mean_f(burst_f2, BURST_SAMPLES, 0.0f);
-    out_burst_mean->f3     = stats_mean_f(burst_f3, BURST_SAMPLES, 0.0f);
-    out_burst_mean->f4     = stats_mean_f(burst_f4, BURST_SAMPLES, 0.0f);
-    out_burst_mean->f5     = stats_mean_f(burst_f5, BURST_SAMPLES, 0.0f);
-    out_burst_mean->f6     = stats_mean_f(burst_f6, BURST_SAMPLES, 0.0f);
-    out_burst_mean->f7     = stats_mean_f(burst_f7, BURST_SAMPLES, 0.0f);
-    out_burst_mean->f8     = stats_mean_f(burst_f8, BURST_SAMPLES, 0.0f);
-    out_burst_mean->clear  = stats_mean_f(burst_clear, BURST_SAMPLES, 0.0f);
-    out_burst_mean->nir    = stats_mean_f(burst_nir, BURST_SAMPLES, 0.0f);
-    out_burst_mean->timestamp = (uint32_t)time(NULL);
+    out->temp      = mean_or_invalid(b_temp, BURST_SAMPLES);
+    out->humid     = mean_or_invalid(b_hum, BURST_SAMPLES);
+    out->temp_raw  = mean_or_invalid(b_temp_raw, BURST_SAMPLES);
+    out->humid_raw = mean_or_invalid(b_hum_raw, BURST_SAMPLES);
+    out->temp_dps  = mean_or_invalid(b_temp_dps, BURST_SAMPLES);
+    out->press     = mean_or_invalid(b_press, BURST_SAMPLES);
+    out->lux       = mean_or_invalid(b_lux, BURST_SAMPLES);
+    out->mic_db    = stats_mean_f(b_mic, BURST_SAMPLES, INVALID_F);
+    out->voc       = stats_mean_f(b_voc, BURST_SAMPLES, INVALID_F);
+    out->nox       = stats_mean_f(b_nox, BURST_SAMPLES, INVALID_F);
+    out->f1    = mean_or_invalid(b_f[0], BURST_SAMPLES);
+    out->f2    = mean_or_invalid(b_f[1], BURST_SAMPLES);
+    out->f3    = mean_or_invalid(b_f[2], BURST_SAMPLES);
+    out->f4    = mean_or_invalid(b_f[3], BURST_SAMPLES);
+    out->f5    = mean_or_invalid(b_f[4], BURST_SAMPLES);
+    out->f6    = mean_or_invalid(b_f[5], BURST_SAMPLES);
+    out->f7    = mean_or_invalid(b_f[6], BURST_SAMPLES);
+    out->f8    = mean_or_invalid(b_f[7], BURST_SAMPLES);
+    out->clear = mean_or_invalid(b_f[8], BURST_SAMPLES);
+    out->nir   = mean_or_invalid(b_f[9], BURST_SAMPLES);
+    out->n_sht  = (uint8_t)stats_count_valid_f(b_temp, BURST_SAMPLES, INVALID_F);
+    out->n_dps  = (uint8_t)stats_count_valid_f(b_press, BURST_SAMPLES, INVALID_F);
+    out->n_veml = (uint8_t)stats_count_valid_f(b_lux, BURST_SAMPLES, INVALID_F);
+    out->n_as   = (uint8_t)stats_count_valid_f(b_f[8], BURST_SAMPLES, INVALID_F);
+    out->as_saturated   = as_sat;
+    out->veml_saturated = veml_sat;
+    out->timestamp = (uint32_t)time(NULL);
+    out->temp_variance     = stats_variance_f(b_temp, BURST_SAMPLES, INVALID_F);
+    out->humidity_variance = stats_variance_f(b_hum, BURST_SAMPLES, INVALID_F);
+}
 
-    float burst_temp_var = stats_variance_f(burst_temps, BURST_SAMPLES, INVALID_F);
-    float burst_hum_var  = stats_variance_f(burst_humids, BURST_SAMPLES, INVALID_F);
-    out_burst_mean->temp_variance = burst_temp_var;
-    out_burst_mean->humidity_variance = burst_hum_var;
+static void push_burst_to_history(const burst_hist_t *new_burst)
+{
+    burst_buffer[burst_buffer_head] = *new_burst;
+    burst_buffer_head = (burst_buffer_head + 1) % BURST_CIRCULAR_SIZE;
+    if (burst_buffer_count < BURST_CIRCULAR_SIZE) burst_buffer_count++;
+}
 
-    printf("-----+-------+-------+----------+---------+---------+-----+-----+-----------------+-----------------+-----------\n");
-    printf("[MED]| %5.2f | %5.2f | %8.2f | %7.2f | %7.2f | %3.0f | %3.0f | %.0f %.0f %.0f %.0f | %.0f %.0f %.0f %.0f | %.0f / %.0f\n",
-            out_burst_mean->temp, out_burst_mean->humid, out_burst_mean->press, out_burst_mean->lux, out_burst_mean->mic_db, out_burst_mean->voc, out_burst_mean->nox,
-            out_burst_mean->f1, out_burst_mean->f2, out_burst_mean->f3, out_burst_mean->f4, out_burst_mean->f5, out_burst_mean->f6, out_burst_mean->f7, out_burst_mean->f8, out_burst_mean->clear, out_burst_mean->nir);
+static void evaluate_flags(const burst_hist_t *m, env_flags_t *f)
+{
+    memset(f, 0, sizeof(*f));
 
-    printf("\n>>> ESTATISTICAS DO BURST %d <<<\n", burst_index);
-    printf("    Temp -> Media: %5.2f °C | Variancia: %5.4f | Desvio Padrao: +-%5.4f °C\n", out_burst_mean->temp, burst_temp_var, sqrtf(burst_temp_var));
-    printf("    Umid -> Media: %5.2f %%  | Variancia: %5.4f | Desvio Padrao: +-%5.4f %%\n", out_burst_mean->humid, burst_hum_var, sqrtf(burst_hum_var));
-    printf("    VOC  -> Media: %5.1f    | NOx -> Media: %5.1f\n", out_burst_mean->voc, out_burst_mean->nox);
+    f->temp_valid  = is_valid(m->temp);
+    f->humid_valid = is_valid(m->humid);
+    f->press_valid = is_valid(m->press);
+    f->lux_valid   = is_valid(m->lux);
+    f->measurement_valid = f->temp_valid && f->humid_valid && f->press_valid && f->lux_valid;
+    f->gas_ready   = gas_index_ready();
+    f->audio_valid = (audio_ml_get_risk_status(&f->audio) == ESP_OK);
 
-    audio_ml_risk_status_t audio_status = {0};
-    if (audio_ml_get_risk_status(&audio_status) == ESP_OK) {
-        printf("    IA   -> RISK: %.3f | Media: %.3f | Votos: %u/%u | Estado: %s\n",
-               audio_status.probability,
-               audio_status.history_average,
-               audio_status.positive_votes,
-               audio_status.history_count,
-               audio_status.risk_active ? "RISCO" : "NORMAL");
+    /* Variacao entre bursts (historico) */
+    float hist[BURST_CIRCULAR_SIZE];
+    int n = 0;
+    for (int i = 0; i < burst_buffer_count; ++i) {
+        if (is_valid(burst_buffer[i].temp)) hist[n++] = burst_buffer[i].temp;
     }
+    f->temp_stddev_hist = (n > 1) ? sqrtf(stats_variance_f(hist, n, INVALID_F)) : 0.0f;
+
+    /* Cada flag depende so do proprio sensor (antes, falha no VEML
+     * desligava as flags de temperatura e umidade). */
+    f->temp_low   = f->temp_valid && m->temp < FLAG_TEMP_MIN_C;
+    f->temp_high  = f->temp_valid && m->temp > FLAG_TEMP_MAX_C;
+    f->temp_out_of_range = f->temp_low || f->temp_high;
+    f->temp_variation    = (n > 1) && f->temp_stddev_hist > FLAG_TEMP_STDDEV_LIMIT_C;
+
+    f->humid_low  = f->humid_valid && m->humid < FLAG_HUMID_MIN_PCT;
+    f->humid_high = f->humid_valid && m->humid > FLAG_HUMID_MAX_PCT;
+    f->humidity_out_of_range = f->humid_low || f->humid_high;
+
+    f->dark = f->lux_valid && m->lux < FLAG_DARK_LUX;
+
+    /* Antes do aquecimento o indice vale 0/100 fixo e gerava falso alarme */
+    f->voc_elevated = f->gas_ready && m->voc >= FLAG_VOC_ELEVATED_INDEX;
+    f->nox_elevated = f->gas_ready && m->nox >= FLAG_NOX_ELEVATED_INDEX;
+
+    f->audio_risk = f->audio_valid && f->audio.risk_active;
+
+    f->critical = f->temp_out_of_range || f->temp_variation ||
+                  f->humidity_out_of_range || f->voc_elevated ||
+                  f->nox_elevated || f->audio_risk;
+}
+
+static void print_burst_report(const burst_hist_t *m, const env_flags_t *f, int burst_index, int total_bursts)
+{
+    char v1[16], v2[16], v3[16];
+
+    printf(C_CYN LINE_EQ C_RST "\n");
+    printf(C_BLD " RESUMO BURST %d/%d" C_RST "   ciclo MQTT %" PRIu32 "   uptime %" PRIu32 " s   " C_DIM "(%s)" C_RST "\n",
+           burst_index, total_bursts, s_mqtt_cycle_number + 1,
+           (uint32_t)(esp_timer_get_time() / 1000000LL), ENV_NORM_NAME);
+    printf(C_CYN LINE_DS C_RST "\n");
+
+    printf("  Temperatura  %s C   sd %.2f  " C_DIM "(bruto %s | DPS %s)" C_RST "  faixa %.0f-%.0f  %s\n",
+           fmt_val(v1, sizeof v1, m->temp, "%6.2f"),
+           is_valid(m->temp) ? sqrtf(m->temp_variance) : 0.0f,
+           fmt_val(v2, sizeof v2, m->temp_raw, "%.2f"),
+           fmt_val(v3, sizeof v3, m->temp_dps, "%.2f"),
+           FLAG_TEMP_MIN_C, FLAG_TEMP_MAX_C,
+           tag_ok(f->temp_out_of_range, f->temp_valid, f->temp_low ? "FRIO" : "QUENTE"));
+
+    printf("  Umidade      %s %%   sd %.2f  " C_DIM "(bruto %s)" C_RST "              faixa %.0f-%.0f  %s\n",
+           fmt_val(v1, sizeof v1, m->humid, "%6.1f"),
+           is_valid(m->humid) ? sqrtf(m->humidity_variance) : 0.0f,
+           fmt_val(v2, sizeof v2, m->humid_raw, "%.1f"),
+           FLAG_HUMID_MIN_PCT, FLAG_HUMID_MAX_PCT,
+           tag_ok(f->humidity_out_of_range, f->humid_valid, f->humid_low ? "SECO" : "UMIDO"));
+
+    printf("  Variacao T   %6.2f C (sd ultimos %d bursts)               limite %.1f  %s\n",
+           f->temp_stddev_hist, burst_buffer_count, FLAG_TEMP_STDDEV_LIMIT_C,
+           tag_ok(f->temp_variation, burst_buffer_count > 1, "PICO"));
+
+    printf("  Pressao      %s hPa\n",
+           fmt_val(v1, sizeof v1, is_valid(m->press) ? m->press / 100.0f : INVALID_F, "%7.2f"));
+
+    printf("  Luz          %s lx%s                                      %s\n",
+           fmt_val(v1, sizeof v1, m->lux, "%7.1f"),
+           m->veml_saturated ? C_YEL " SATURADO" C_RST : "",
+           !f->lux_valid ? C_DIM "[ sem dado ]" C_RST
+                         : (f->dark ? C_YEL "[ ESCURO ]" C_RST : C_GRN "[ ACESO ]" C_RST));
+
+    printf("  Som          %6.1f dB\n", m->mic_db);
+
+    if (f->gas_ready) {
+        printf("  VOC Index    %6.0f      (100 = media 24 h)           alerta >= %.0f  %s\n",
+               m->voc, FLAG_VOC_ELEVATED_INDEX, tag_ok(f->voc_elevated, true, "ELEVADO"));
+        printf("  NOx Index    %6.0f      (1 = linha de base)          alerta >= %.0f  %s\n",
+               m->nox, FLAG_NOX_ELEVATED_INDEX, tag_ok(f->nox_elevated, true, "ELEVADO"));
+    } else {
+        printf("  VOC/NOx      %6.0f / %.0f " C_YEL "(aquecendo/aprendendo, flags desativadas)" C_RST "\n",
+               m->voc, m->nox);
+    }
+
+    printf("  Espectro     F1 %.0f  F2 %.0f  F3 %.0f  F4 %.0f  F5 %.0f  F6 %.0f  F7 %.0f  F8 %.0f\n"
+           "               CLR %.0f  NIR %.0f%s\n",
+           m->f1, m->f2, m->f3, m->f4, m->f5, m->f6, m->f7, m->f8, m->clear, m->nir,
+           m->as_saturated ? C_YEL "   SATURADO (reduza ganho do AS7341)" C_RST : "");
+
+    if (f->audio_valid) {
+        printf("  IA audio     p=%.3f  media=%.3f  votos %u/%u                     %s\n",
+               f->audio.probability, f->audio.history_average,
+               f->audio.positive_votes, f->audio.history_count,
+               f->audio.risk_active ? C_RED C_BLD "[ RISCO ]" C_RST : C_GRN "[ NORMAL ]" C_RST);
+    } else {
+        printf("  IA audio     " C_DIM "sem status" C_RST "\n");
+    }
+
+    printf(C_DIM "  Leituras ok: SHT40 %u/%d  DPS368 %u/%d  VEML %u/%d  AS7341 %u/%d  SGP41 %s" C_RST "\n",
+           m->n_sht, BURST_SAMPLES, m->n_dps, BURST_SAMPLES, m->n_veml, BURST_SAMPLES,
+           m->n_as, BURST_SAMPLES,
+           !s_sgp41_ready ? "falha" : (f->gas_ready ? "pronto" : "aquecendo"));
+
+    /* Historico compacto */
+    printf(C_CYN LINE_DS C_RST "\n");
+    printf(C_DIM "  Historico   T(C)    UR(%%)   P(hPa)    Lux     dB    VOC  NOx" C_RST "\n");
+    for (int i = 0; i < burst_buffer_count; ++i) {
+        const int idx = (burst_buffer_head - burst_buffer_count + i + BURST_CIRCULAR_SIZE) % BURST_CIRCULAR_SIZE;
+        const burst_hist_t *h = &burst_buffer[idx];
+        char a[12], b[12], c[12], d[12];
+        printf("  %s%d%s        %6s  %6s  %7s  %6s  %5.1f  %4.0f %4.0f\n",
+               (i == burst_buffer_count - 1) ? C_BLD : "", i + 1, (i == burst_buffer_count - 1) ? " <" C_RST : "  ",
+               fmt_val(a, sizeof a, h->temp, "%6.2f"),
+               fmt_val(b, sizeof b, h->humid, "%6.1f"),
+               fmt_val(c, sizeof c, is_valid(h->press) ? h->press / 100.0f : INVALID_F, "%7.1f"),
+               fmt_val(d, sizeof d, h->lux, "%6.0f"),
+               h->mic_db, h->voc, h->nox);
+    }
+
+    /* Status geral - exatamente as mesmas flags enviadas no MQTT */
+    printf(C_CYN LINE_DS C_RST "\n");
+    if (!f->critical) {
+        printf("  STATUS: " C_GRN C_BLD "OK" C_RST "%s\n",
+               f->measurement_valid ? "" : C_YEL "  (algum sensor sem dado)" C_RST);
+    } else {
+        printf("  STATUS: " C_RED C_BLD "CRITICO" C_RST " ->");
+        if (f->temp_low)       printf(" TEMP_BAIXA");
+        if (f->temp_high)      printf(" TEMP_ALTA");
+        if (f->temp_variation) printf(" VARIACAO_TEMP");
+        if (f->humid_low)      printf(" UMIDADE_BAIXA");
+        if (f->humid_high)     printf(" UMIDADE_ALTA");
+        if (f->voc_elevated)   printf(" VOC");
+        if (f->nox_elevated)   printf(" NOX");
+        if (f->audio_risk)     printf(" AUDIO_RISCO");
+        printf("\n");
+    }
+    printf(C_CYN LINE_EQ C_RST "\n");
 }
 
 static void publish_burst_mean(
-    const burst_hist_t *mean,
+    const burst_hist_t *m,
+    const env_flags_t *f,
     int burst_index,
     int total_bursts)
 {
-    if (mean == NULL) {
+    if (m == NULL || f == NULL) {
         return;
     }
 
-    audio_ml_risk_status_t audio = {0};
-    const bool audio_status_valid =
-        (audio_ml_get_risk_status(&audio) == ESP_OK);
-
-    const bool measurement_valid =
-        mean->temp != INVALID_F &&
-        mean->humid != INVALID_F &&
-        mean->press != INVALID_F &&
-        mean->lux != INVALID_F;
-
-    const bool flag_temp_out_of_range =
-        measurement_valid &&
-        (mean->temp < FLAG_TEMP_MIN_C || mean->temp > FLAG_TEMP_MAX_C);
-
-    const bool flag_temp_variation =
-        mean->temp_variance > FLAG_TEMP_VARIANCE_LIMIT;
-
-    const bool flag_humidity_out_of_range =
-        measurement_valid &&
-        (mean->humid < FLAG_HUMID_MIN_PCT || mean->humid > FLAG_HUMID_MAX_PCT);
-
-    const bool flag_dark =
-        measurement_valid && mean->lux < FLAG_DARK_LUX;
-
-    const bool flag_voc_elevated =
-        mean->voc >= FLAG_VOC_ELEVATED_INDEX;
-
-    const bool flag_nox_elevated =
-        mean->nox >= FLAG_NOX_ELEVATED_INDEX;
-
-    const bool flag_audio_risk =
-        audio_status_valid && audio.risk_active;
-
-    const bool flag_critical =
-        flag_temp_out_of_range ||
-        flag_temp_variation ||
-        flag_humidity_out_of_range ||
-        flag_voc_elevated ||
-        flag_nox_elevated ||
-        flag_audio_risk;
-
-    const bool flag_gas_ready =
-        s_sgp41_ready && s_sgp41_conditioned;
-
     ++s_mqtt_cycle_number;
+
+    /* Valores invalidos vao como null no JSON */
+    char t_s[16], h_s[16], p_s[16], l_s[16], td_s[16], tr_s[16];
+#define JNUM(buf, v, fmt) (is_valid(v) ? (snprintf(buf, sizeof buf, fmt, (double)(v)), buf) : "null")
 
     char payload[MQTT_PAYLOAD_MAX_LEN];
     const int len = snprintf(
@@ -511,12 +734,15 @@ static void publish_burst_mean(
         "\"cycle\":%" PRIu32 ","
         "\"burst\":%d,"
         "\"total_bursts\":%d,"
-        "\"samples\":20,"
+        "\"samples\":%d,"
         "\"uptime_ms\":%" PRIu64 ","
-        "\"temperature_c\":%.2f,"
-        "\"humidity_pct\":%.2f,"
-        "\"pressure_pa\":%.2f,"
-        "\"lux\":%.2f,"
+        "\"temperature_c\":%s,"
+        "\"humidity_pct\":%s,"
+        "\"temperature_raw_c\":%s,"
+        "\"temperature_dps_c\":%s,"
+        "\"temp_offset_c\":%.2f,"
+        "\"pressure_pa\":%s,"
+        "\"lux\":%s,"
         "\"mic_db\":%.2f,"
         "\"voc_index\":%.1f,"
         "\"nox_index\":%.1f,"
@@ -528,6 +754,7 @@ static void publish_burst_mean(
         "\"audio_votes\":%u,"
         "\"audio_history\":%u,"
         "\"audio_risk\":%s,"
+        "\"norm\":\"%s\","
         "\"flags\":{"
         "\"measurement_valid\":%s,"
         "\"audio_status_valid\":%s,"
@@ -545,161 +772,88 @@ static void publish_burst_mean(
         s_mqtt_cycle_number,
         burst_index,
         total_bursts,
+        BURST_SAMPLES,
         (uint64_t)(esp_timer_get_time() / 1000LL),
-        mean->temp,
-        mean->humid,
-        mean->press,
-        mean->lux,
-        mean->mic_db,
-        mean->voc,
-        mean->nox,
-        mean->f1, mean->f2, mean->f3, mean->f4,
-        mean->f5, mean->f6, mean->f7, mean->f8,
-        mean->clear,
-        mean->nir,
-        audio_status_valid ? audio.probability : 0.0f,
-        audio_status_valid ? audio.history_average : 0.0f,
-        audio_status_valid ? audio.positive_votes : 0U,
-        audio_status_valid ? audio.history_count : 0U,
-        flag_audio_risk ? "true" : "false",
-        measurement_valid ? "true" : "false",
-        audio_status_valid ? "true" : "false",
-        flag_gas_ready ? "true" : "false",
-        flag_temp_out_of_range ? "true" : "false",
-        flag_temp_variation ? "true" : "false",
-        flag_humidity_out_of_range ? "true" : "false",
-        flag_dark ? "true" : "false",
-        flag_voc_elevated ? "true" : "false",
-        flag_nox_elevated ? "true" : "false",
-        flag_audio_risk ? "true" : "false",
-        flag_critical ? "true" : "false");
+        JNUM(t_s, m->temp, "%.2f"),
+        JNUM(h_s, m->humid, "%.2f"),
+        JNUM(tr_s, m->temp_raw, "%.2f"),
+        JNUM(td_s, m->temp_dps, "%.2f"),
+        TEMP_OFFSET_C,
+        JNUM(p_s, m->press, "%.2f"),
+        JNUM(l_s, m->lux, "%.2f"),
+        m->mic_db,
+        m->voc,
+        m->nox,
+        is_valid(m->f1) ? m->f1 : 0.0f, is_valid(m->f2) ? m->f2 : 0.0f,
+        is_valid(m->f3) ? m->f3 : 0.0f, is_valid(m->f4) ? m->f4 : 0.0f,
+        is_valid(m->f5) ? m->f5 : 0.0f, is_valid(m->f6) ? m->f6 : 0.0f,
+        is_valid(m->f7) ? m->f7 : 0.0f, is_valid(m->f8) ? m->f8 : 0.0f,
+        is_valid(m->clear) ? m->clear : 0.0f,
+        is_valid(m->nir) ? m->nir : 0.0f,
+        f->audio_valid ? f->audio.probability : 0.0f,
+        f->audio_valid ? f->audio.history_average : 0.0f,
+        f->audio_valid ? f->audio.positive_votes : 0U,
+        f->audio_valid ? f->audio.history_count : 0U,
+        f->audio_risk ? "true" : "false",
+        ENV_NORM_NAME,
+        f->measurement_valid ? "true" : "false",
+        f->audio_valid ? "true" : "false",
+        f->gas_ready ? "true" : "false",
+        f->temp_out_of_range ? "true" : "false",
+        f->temp_variation ? "true" : "false",
+        f->humidity_out_of_range ? "true" : "false",
+        f->dark ? "true" : "false",
+        f->voc_elevated ? "true" : "false",
+        f->nox_elevated ? "true" : "false",
+        f->audio_risk ? "true" : "false",
+        f->critical ? "true" : "false");
+#undef JNUM
 
     if (len < 0 || (size_t)len >= sizeof(payload)) {
-        ESP_LOGE(TAG,
-                 "Payload MQTT excedeu o buffer de %u bytes",
-                 (unsigned)sizeof(payload));
+        ESP_LOGE(TAG, "Payload MQTT excedeu o buffer de %u bytes", (unsigned)sizeof(payload));
         return;
     }
 
     if (!mqtt_is_connected()) {
-        ESP_LOGW(TAG,
-                 "Media das 20 leituras pronta, mas MQTT esta desconectado; ciclo=%" PRIu32,
-                 s_mqtt_cycle_number);
+        printf(C_YEL "  MQTT: desconectado, ciclo %" PRIu32 " nao enviado" C_RST "\n",
+               s_mqtt_cycle_number);
         return;
     }
 
-    ESP_LOGI(TAG,
-             "20 leituras concluidas. Pausando sensores e audio; ciclo=%" PRIu32,
-             s_mqtt_cycle_number);
+    ESP_LOGD(TAG, "Pausando sensores e audio para envio; ciclo=%" PRIu32, s_mqtt_cycle_number);
 
-    const esp_err_t pause_err =
-        audio_ml_pause(AUDIO_PAUSE_TIMEOUT_MS);
-
+    const esp_err_t pause_err = audio_ml_pause(AUDIO_PAUSE_TIMEOUT_MS);
     if (pause_err != ESP_OK) {
-        ESP_LOGW(TAG,
-                 "Envio cancelado porque o audio nao pausou: %s",
-                 esp_err_to_name(pause_err));
+        printf(C_YEL "  MQTT: envio cancelado (audio nao pausou: %s)" C_RST "\n",
+               esp_err_to_name(pause_err));
         return;
     }
 
     /* Janela silenciosa depois da ultima transacao de sensor. */
     vTaskDelay(pdMS_TO_TICKS(MQTT_PRE_TX_QUIET_MS));
 
+    const int64_t t0 = esp_timer_get_time();
     int msg_id = -1;
-    const esp_err_t err = mqtt_publish_sensor_data(
-        payload,
-        (size_t)len,
-        MQTT_PUBLISH_TIMEOUT_MS,
-        &msg_id);
+    const esp_err_t err = mqtt_publish_sensor_data(payload, (size_t)len, MQTT_PUBLISH_TIMEOUT_MS, &msg_id);
+    const int64_t dt_ms = (esp_timer_get_time() - t0) / 1000LL;
 
     if (err == ESP_OK) {
-        ESP_LOGI(TAG,
-                 "Ciclo=%" PRIu32 " enviado e confirmado; msg_id=%d",
-                 s_mqtt_cycle_number,
-                 msg_id);
+        printf(C_GRN "  MQTT: ciclo %" PRIu32 " enviado e confirmado" C_RST C_DIM
+               " (msg_id=%d, %" PRId64 " ms, %d bytes)" C_RST "\n",
+               s_mqtt_cycle_number, msg_id, dt_ms, len);
     } else {
-        ESP_LOGW(TAG,
-                 "Falha enviando ciclo=%" PRIu32 ": %s",
-                 s_mqtt_cycle_number,
-                 esp_err_to_name(err));
+        printf(C_RED "  MQTT: falha no ciclo %" PRIu32 ": %s" C_RST "\n",
+               s_mqtt_cycle_number, esp_err_to_name(err));
     }
 
     /* Margem para o radio encerrar os ultimos pacotes antes das leituras. */
     vTaskDelay(pdMS_TO_TICKS(MQTT_POST_TX_GUARD_MS));
     audio_ml_resume();
-    ESP_LOGI(TAG, "Todas as leituras liberadas para o proximo burst");
-}
-
-static void push_burst_to_history(const burst_hist_t *new_burst)
-{
-    burst_buffer[burst_buffer_head] = *new_burst;
-    burst_buffer_head = (burst_buffer_head + 1) % BURST_CIRCULAR_SIZE;
-    if (burst_buffer_count < BURST_CIRCULAR_SIZE) burst_buffer_count++;
-}
-
-static void print_burst_history(void)
-{
-    float hist_temps[BURST_CIRCULAR_SIZE];
-    float hist_humids[BURST_CIRCULAR_SIZE];
-    float hist_voc[BURST_CIRCULAR_SIZE];
-    float hist_nox[BURST_CIRCULAR_SIZE];
-
-    printf("\n--- BURST HISTORY (LAST %02d BURSTS) ---\n", burst_buffer_count);
-    printf(" idx | Temp(°C) | Umid(%%) | Press(Pa) | Lux | Mic(dB) | VOC | NOx \n");
-    printf("-----+----------+---------+-----------+-----+---------+-----+-----\n");
-    
-    // Pegamos a última amostra inserida para avaliar as flags instantâneas de estado ambiente
-    int last_inserted_idx = (burst_buffer_head - 1 + BURST_CIRCULAR_SIZE) % BURST_CIRCULAR_SIZE;
-    float current_temp  = burst_buffer[last_inserted_idx].temp;
-    float current_humid = burst_buffer[last_inserted_idx].humid;
-    float current_lux   = burst_buffer[last_inserted_idx].lux;
-    float current_voc   = burst_buffer[last_inserted_idx].voc;
-
-    for (int i = 0; i < burst_buffer_count; ++i) {
-        int idx = (burst_buffer_head - burst_buffer_count + i + BURST_CIRCULAR_SIZE) % BURST_CIRCULAR_SIZE;
-        
-        printf("  %d  |  %5.2f   |  %5.2f  | %9.1f | %3.0f |  %6.2f | %3.0f | %3.0f\n",
-               i + 1, burst_buffer[idx].temp, burst_buffer[idx].humid, burst_buffer[idx].press,
-               burst_buffer[idx].lux, burst_buffer[idx].mic_db, burst_buffer[idx].voc, burst_buffer[idx].nox);
-
-        hist_temps[i]  = burst_buffer[idx].temp;
-        hist_humids[i] = burst_buffer[idx].humid;
-        hist_voc[i]    = burst_buffer[idx].voc;
-        hist_nox[i]    = burst_buffer[idx].nox;
-    }
-    printf("--------------------------------------------------------------------\n");
-
-    if (burst_buffer_count > 1) {
-        float var_temp = stats_variance_f(hist_temps, burst_buffer_count, INVALID_F);
-        float var_hum  = stats_variance_f(hist_humids, burst_buffer_count, INVALID_F);
-        float var_voc  = stats_variance_f(hist_voc, burst_buffer_count, INVALID_F);
-        float var_nox  = stats_variance_f(hist_nox, burst_buffer_count, INVALID_F);
-
-        // --- EVALUATE ENVIRONMENTAL FLAGS & SYSTEM THRESHOLDS ---
-        bool flag_temp_variance = (var_temp > 5.0f);
-        bool flag_temp_range    = (current_temp < 20.0f || current_temp > 29.0f);
-        bool flag_humid_elderly = (current_humid < 45.0f || current_humid > 85.0f);
-        const char* lux_state = (current_lux < 10.0f) ? "DARK (OFF)" : "LIT (ON)";
-        const char* voc_state =
-            (current_voc >= 150.0f) ? "ELEVATED VS BASELINE" :
-            (current_voc >= 120.0f) ? "ABOVE BASELINE" :
-            (current_voc >= 80.0f)  ? "NEAR BASELINE" :
-                                      "BELOW BASELINE";
-
-        printf(">>> SYSTEM MONITORING FLAGS & CRITICAL ALERTS <<<\n");
-        printf("    [TEMP VAR] : %s (Var: %5.4f °C)\n", flag_temp_variance ? " CRITICAL SPIKE" : "OK STABLE", var_temp);
-        printf("    [TEMP COMF]: %s (Current: %5.2f °C | Ideal: 20-29°C)\n", flag_temp_range ? " OUT OF RANGE" : "OK COMFORT", current_temp);
-        printf("    [ELDER HUM]: %s (Current: %5.2f %%  | Ideal: 45-85%%)\n", flag_humid_elderly ? " ATTENTION (RISK)" : "OK HEALTHY", current_humid);
-        printf("    [LUX STATE]: %s (Current: %.0f Lux)\n", lux_state, current_lux);
-        printf("    [VOC INDEX]: %s (Current: %.0f | adaptive baseline ~100; nao e concentracao de seguranca)\n", voc_state, current_voc);
-        printf("    Var Hist   | Var Umid: %5.4f | Var VOC: %5.2f | Var NOx: %5.2f\n", var_hum, var_voc, var_nox);
-        printf("--------------------------------------------------------------------\n");
-    }
 }
 
 static void execute_light_sleep(void)
 {
-    const int BASE_SLEEP_MS = 10000;         
+    const int BASE_SLEEP_MS = 10000;
     printf("\n> Dormindo por %d segundos...\n", BASE_SLEEP_MS / 1000);
     vTaskDelay(pdMS_TO_TICKS(50));
 
@@ -713,32 +867,18 @@ static void execute_light_sleep(void)
     }
 }
 
-static void process_long_cycle(float temp_sum, float hum_sum, float press_sum, float lux_sum, float mic_sum, float voc_sum, float nox_sum, float *spectral_sums)
+static void process_long_cycle(const float *avg)
 {
-    const int BASE_REPEAT = 5;              
-    longa_t new_longa;
+    longa_t L = {
+        .temp = avg[0], .humid = avg[1], .press = avg[2], .lux = avg[3],
+        .mic_db = avg[4], .voc = avg[5], .nox = avg[6],
+        .f1 = avg[7], .f2 = avg[8], .f3 = avg[9], .f4 = avg[10],
+        .f5 = avg[11], .f6 = avg[12], .f7 = avg[13], .f8 = avg[14],
+        .clear = avg[15], .nir = avg[16],
+        .ts = (uint32_t)time(NULL),
+    };
 
-    new_longa.temp   = temp_sum / (float)BASE_REPEAT;
-    new_longa.humid  = hum_sum / (float)BASE_REPEAT;
-    new_longa.press  = press_sum / (float)BASE_REPEAT;
-    new_longa.lux    = lux_sum / (float)BASE_REPEAT;
-    new_longa.mic_db = mic_sum / (float)BASE_REPEAT;
-    new_longa.voc    = voc_sum / (float)BASE_REPEAT;
-    new_longa.nox    = nox_sum / (float)BASE_REPEAT;
-    
-    new_longa.f1    = spectral_sums[0] / (float)BASE_REPEAT;
-    new_longa.f2    = spectral_sums[1] / (float)BASE_REPEAT;
-    new_longa.f3    = spectral_sums[2] / (float)BASE_REPEAT;
-    new_longa.f4    = spectral_sums[3] / (float)BASE_REPEAT;
-    new_longa.f5    = spectral_sums[4] / (float)BASE_REPEAT;
-    new_longa.f6    = spectral_sums[5] / (float)BASE_REPEAT;
-    new_longa.f7    = spectral_sums[6] / (float)BASE_REPEAT;
-    new_longa.f8    = spectral_sums[7] / (float)BASE_REPEAT;
-    new_longa.clear = spectral_sums[8] / (float)BASE_REPEAT;
-    new_longa.nir   = spectral_sums[9] / (float)BASE_REPEAT;
-    new_longa.ts    = (uint32_t)time(NULL);
-
-    longa_buffer[buffer_head] = new_longa;
+    longa_buffer[buffer_head] = L;
     buffer_head = (buffer_head + 1) % CIRCULAR_SIZE;
     if (buffer_count < CIRCULAR_SIZE) buffer_count++;
 
@@ -746,17 +886,21 @@ static void process_long_cycle(float temp_sum, float hum_sum, float press_sum, f
     for (int i = 0; i < buffer_count; ++i) {
         temp_buf[i] = longa_buffer[i].temp;
     }
-    float var_temp_buf = stats_variance_f(temp_buf, buffer_count, INVALID_F);
+    const float var_temp_buf = stats_variance_f(temp_buf, buffer_count, INVALID_F);
 
-    printf("\n\n");
-    printf(" RESUMO DO CICLO LONGO (TS=%" PRIu32 ") \n", new_longa.ts);
-    printf("MEDIAS DO AMBIENTE: \n");
-    printf("Temp: %5.2f °C | Umid: %5.2f %% | Press: %8.2f Pa \n", new_longa.temp, new_longa.humid, new_longa.press);
-    printf(" Lux:  %5.1f    | Mic:  %5.2f dB | VOC:  %5.1f    | NOx:  %5.1f\n", new_longa.lux, new_longa.mic_db, new_longa.voc, new_longa.nox);
-    fflush(stdout);
-    vTaskDelay(pdMS_TO_TICKS(30));
-    printf(" HISTORICO GERAL (ULTIMOS %02d CICLOS) \n", buffer_count);
-    printf(" Variancia Temp: %5.4f | Desvio Padrao: +-%5.4f °C \n", var_temp_buf, sqrtf(var_temp_buf));
+    char a[16], b[16], c[16], d[16];
+    printf("\n" C_CYN LINE_EQ "\n" C_RST C_BLD " CICLO LONGO" C_RST "  media de %d bursts (~%d s)\n",
+           BASE_REPEAT, BASE_REPEAT * BURST_DURATION_MS / 1000);
+    printf("  T %s C | UR %s %% | P %s hPa | Lux %s | %5.1f dB | VOC %.0f | NOx %.0f\n",
+           fmt_val(a, sizeof a, L.temp, "%.2f"),
+           fmt_val(b, sizeof b, L.humid, "%.1f"),
+           fmt_val(c, sizeof c, is_valid(L.press) ? L.press / 100.0f : INVALID_F, "%.2f"),
+           fmt_val(d, sizeof d, L.lux, "%.1f"),
+           is_valid(L.mic_db) ? L.mic_db : 0.0f,
+           is_valid(L.voc) ? L.voc : 0.0f,
+           is_valid(L.nox) ? L.nox : 0.0f);
+    printf("  Ultimos %d ciclos longos: sd T = %.3f C\n", buffer_count, sqrtf(var_temp_buf));
+    printf(C_CYN LINE_EQ C_RST "\n");
 }
 
 esp_err_t sensor_task_start(i2c_master_bus_handle_t bus_handle)

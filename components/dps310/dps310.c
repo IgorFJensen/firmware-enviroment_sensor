@@ -37,13 +37,15 @@ static esp_err_t dps_write_reg(uint8_t reg, uint8_t value) {
     return i2c_master_transmit(dps_handle, buf, 2, I2C_TIMEOUT_MS);
 }
 
-static int32_t dps_read_raw24(uint8_t reg_base) {
+static esp_err_t dps_read_raw24(uint8_t reg_base, int32_t *out) {
     uint8_t buf[3];
-    if (dps_read_reg(reg_base, buf, 3) != ESP_OK) return 0;
+    esp_err_t err = dps_read_reg(reg_base, buf, 3);
+    if (err != ESP_OK) return err;   /* antes retornava 0 e virava uma temperatura falsa */
     // Dados sao 24-bit 2's complement
     int32_t val = (int32_t)((buf[0] << 16) | (buf[1] << 8) | buf[2]);
-    if (val & 0x800000) val |= 0xFF000000; 
-    return val;
+    if (val & 0x800000) val |= 0xFF000000;
+    *out = val;
+    return ESP_OK;
 }
 
 static void dps_read_calibration(void) {
@@ -128,8 +130,10 @@ esp_err_t dps310_init(i2c_master_bus_handle_t bus) {
 esp_err_t dps310_read(float *temperature, float *pressure) {
     if (!temperature || !pressure) return ESP_ERR_INVALID_ARG;
 
-    int32_t raw_t = dps_read_raw24(REG_TMP_B2);
-    int32_t raw_p = dps_read_raw24(REG_PSR_B2);
+    int32_t raw_t = 0, raw_p = 0;
+    esp_err_t err = dps_read_raw24(REG_TMP_B2, &raw_t);
+    if (err == ESP_OK) err = dps_read_raw24(REG_PSR_B2, &raw_p);
+    if (err != ESP_OK) return err;
 
     // Escalonamento (Tabela 9)
     float sc_t = (float)raw_t / k_factor;

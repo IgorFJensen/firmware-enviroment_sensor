@@ -1,15 +1,12 @@
+# Caminhos aqui sao relativos a pasta ml/
 .venv/
 __pycache__/
 *.pyc
-build/*.keras
-build/*.tflite
-build/*.json
-ml/dataset/raw/
-ml/dataset/processed/
-ml/dataset/voicevote/
-.wav
-.mp3
-.flac
-ml/build/
+build/
 runs/
-
+dataset/*
+!dataset/voicevote_v61_manifest.csv
+!dataset/voicevote_v61_report.json
+*.wav
+*.mp3
+*.flac
