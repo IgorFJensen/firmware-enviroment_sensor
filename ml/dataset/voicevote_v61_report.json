@@ -1,0 +1,39 @@
+{
+    "configuration": {
+        "sample_rate": 16000,
+        "window_samples": 16000,
+        "hop_samples": 8000,
+        "minimum_last_samples": 12000,
+        "minimum_responses": 7,
+        "minimum_binary_confidence": 0.7,
+        "maximum_disgust_fraction": 0.25,
+        "risk_votes": [
+            "A",
+            "F",
+            "S"
+        ],
+        "non_risk_votes": [
+            "H",
+            "N"
+        ]
+    },
+    "original_clips": {
+        "risk": 1410,
+        "non_risk": 2901
+    },
+    "segments": {
+        "risk": 6015,
+        "non_risk": 11172
+    },
+    "counters": {
+        "voice_rows": 7442,
+        "accepted_non_risk": 2901,
+        "skipped_disgust_ambiguous": 1240,
+        "skipped_low_binary_confidence": 1823,
+        "accepted_risk": 1410,
+        "skipped_few_responses": 68,
+        "ignored_non_voice_rows": 14884,
+        "audio_not_selected": 3131
+    },
+    "errors": []
+}

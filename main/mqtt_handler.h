@@ -2,16 +2,42 @@
 #define MQTT_HANDLER_H
 
 #include <stdbool.h>
-#include "mqtt_client.h"
+#include <stddef.h>
+#include <stdint.h>
+
 #include "esp_err.h"
 
-// Inicia a configuração do MQTT
-void mqtt_app_start(void);
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-// Verifica se está conectado para evitar erros de publicação
+void mqtt_app_start(void);
 bool mqtt_is_connected(void);
 
-// Publica dados no tópico padrão
-int mqtt_publish_sensor_data(const char *payload, int len);
+/**
+ * Publica em sensors/data com QoS 1 e retain, aguardando a confirmacao do
+ * broker. Enquanto esta funcao estiver bloqueada, a task chamadora nao inicia
+ * novas leituras de sensores.
+ */
+esp_err_t mqtt_publish_sensor_data(
+    const char *payload,
+    size_t len,
+    uint32_t timeout_ms,
+    int *out_msg_id);
 
-#endif // MQTT_HANDLER_H
+/**
+ * Publica um alerta em sensors/alert com QoS 1 e retain, aguardando a
+ * confirmacao do broker. As publicacoes sao serializadas: se as medias
+ * estiverem sendo enviadas, o alerta sai logo em seguida.
+ */
+esp_err_t mqtt_publish_alert(
+    const char *payload,
+    size_t len,
+    uint32_t timeout_ms,
+    int *out_msg_id);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* MQTT_HANDLER_H */
