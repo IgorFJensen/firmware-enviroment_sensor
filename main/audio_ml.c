@@ -93,6 +93,24 @@ static inline int16_t pcm24_to_pcm16(int32_t raw)
     return (int16_t)sample;
 }
 
+/*
+ * Nivel sonoro em dB SPL (sem ponderacao A).
+ *
+ * ICS-43434 (datasheet v1.2): 1 kHz a 94 dB SPL -> -26 dBFS, onde 0 dBFS e
+ * uma senoide cujo PICO toca o fundo de escala de 24 bits (2^23).
+ * Para uma senoide, RMS = pico / sqrt(2), entao:
+ *     dBFS = 20*log10(rms * sqrt(2) / 2^23)
+ *     dB SPL = dBFS + 94 + 26 = 20*log10(rms) - 15.46
+ * Antes o codigo usava so 20*log10(rms em contagens), que fica ~15.5 dB
+ * acima do SPL real (um quarto silencioso aparecia como ~70 dB).
+ */
+#define MIC_FULL_SCALE_24      8388608.0   /* 2^23 */
+#define MIC_SENSITIVITY_DBFS   (-26.0)     /* a 94 dB SPL, 1 kHz */
+#define MIC_REF_DB_SPL         94.0
+#ifndef MIC_DB_CAL_OFFSET
+#define MIC_DB_CAL_OFFSET      0.0         /* ajuste fino contra um decibelimetro */
+#endif
+
 static void update_mic_level(
     const int32_t *raw,
     size_t samples)
@@ -101,24 +119,24 @@ static void update_mic_level(
         return;
     }
 
-    double sum_squares = 0.0;
-
+    /* Remove o nivel DC antes do RMS */
+    double mean = 0.0;
     for (size_t i = 0; i < samples; ++i) {
-        const int32_t sample24 = raw[i] >> 8;
+        mean += (double)(raw[i] >> 8);
+    }
+    mean /= (double)samples;
 
-        sum_squares +=
-            (double)sample24 *
-            (double)sample24;
+    double sum_squares = 0.0;
+    for (size_t i = 0; i < samples; ++i) {
+        const double v = (double)(raw[i] >> 8) - mean;
+        sum_squares += v * v;
     }
 
-    const double mean_square =
-        sum_squares / (double)samples;
-
-    const double rms = sqrt(mean_square);
+    const double rms = sqrt(sum_squares / (double)samples);
 
     if (rms > 0.0) {
-        s_latest_mic_db =
-            (float)(20.0 * log10(rms));
+        const double dbfs = 20.0 * log10(rms * 1.41421356237 / MIC_FULL_SCALE_24);
+        s_latest_mic_db = (float)(dbfs - MIC_SENSITIVITY_DBFS + MIC_REF_DB_SPL + MIC_DB_CAL_OFFSET);
     } else {
         s_latest_mic_db = 0.0f;
     }
