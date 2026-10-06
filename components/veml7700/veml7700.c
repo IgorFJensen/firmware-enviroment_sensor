@@ -268,5 +268,15 @@ float veml7700_raw_to_lux(uint16_t raw)
                               * (800.0f / integration_ms)
                               * (2.0f / gain_factor);
 
-    return (float)raw * resolution_lx;
+    float lux = (float)raw * resolution_lx;
+
+    /*
+     * Correcao de nao-linearidade da Vishay (app note "Designing the
+     * VEML7700 Into an Application"): acima de ~1000 lx a resposta deixa
+     * de ser linear e a leitura fica BAIXA sem esta correcao.
+     */
+    if (lux > 1000.0f) {
+        lux = (((6.0135e-13f * lux - 9.3924e-9f) * lux + 8.1488e-5f) * lux + 1.0023f) * lux;
+    }
+    return lux;
 }

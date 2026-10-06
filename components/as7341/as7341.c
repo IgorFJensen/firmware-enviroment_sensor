@@ -294,64 +294,48 @@ static void as7341_dump_smux(void)
 static esp_err_t as7341_load_smux(
     const uint8_t *config)
 {
+    /* Sem ESP_ERROR_CHECK: um NACK no I2C reiniciava o ESP32 inteiro. */
     uint8_t cfg0;
-
-    ESP_ERROR_CHECK(
-        as7341_read_reg(
-            AS7341_REG_CFG0,
-            &cfg0)
-    );
+    esp_err_t err = as7341_read_reg(AS7341_REG_CFG0, &cfg0);
+    if (err != ESP_OK) return err;
 
     /* BANK = 1 */
-    ESP_ERROR_CHECK(
-        as7341_write_reg(
-            AS7341_REG_CFG0,
-            cfg0 | AS7341_CFG0_BANK)
-    );
-
+    err = as7341_write_reg(AS7341_REG_CFG0, cfg0 | AS7341_CFG0_BANK);
+    if (err != ESP_OK) return err;
     vTaskDelay(pdMS_TO_TICKS(1));
 
     for (int i = 0; i < 20; i++) {
-
-        ESP_ERROR_CHECK(
-            as7341_write_reg(
-                i,
-                config[i])
-        );
+        err = as7341_write_reg(i, config[i]);
+        if (err != ESP_OK) break;
     }
 
-    /* BANK = 0 */
-    ESP_ERROR_CHECK(
-        as7341_write_reg(
-            AS7341_REG_CFG0,
-            cfg0 & ~AS7341_CFG0_BANK)
-    );
-
+    /* BANK = 0 (sempre tenta voltar) */
+    esp_err_t err2 = as7341_write_reg(AS7341_REG_CFG0, cfg0 & ~AS7341_CFG0_BANK);
     vTaskDelay(pdMS_TO_TICKS(1));
-
-
-
-    return ESP_OK;
+    return (err != ESP_OK) ? err : err2;
 }
 
 /* =========================================================
  * START MEASUREMENT
  * ========================================================= */
 
+#define AS_TRY(x) do { esp_err_t _e = (x); if (_e != ESP_OK) { \
+    ESP_LOGW(TAG, "%s falhou: %s", #x, esp_err_to_name(_e)); return _e; } } while (0)
+
 static esp_err_t as7341_start_measurement(
     const uint8_t *smux)
 {
-   ESP_ERROR_CHECK(as7341_set_enable(true, false, false));
+    AS_TRY(as7341_set_enable(true, false, false));
     vTaskDelay(pdMS_TO_TICKS(1));
 
     /* Load SMUX na RAM */
-    ESP_ERROR_CHECK(as7341_load_smux(smux));
+    AS_TRY(as7341_load_smux(smux));
 
-    /* 1. Ativa o bit SMUXEN primeiro! */
-    ESP_ERROR_CHECK(as7341_set_enable(true, false, true));
+    /* 1. Ativa o bit SMUXEN primeiro */
+    AS_TRY(as7341_set_enable(true, false, true));
 
-    /* 2. AGORA SIM, envia o comando de Apply SMUX */
-    ESP_ERROR_CHECK(as7341_write_reg(AS7341_REG_CONTROL, AS7341_CONTROL_SMUX_CMD));
+    /* 2. Comando de Apply SMUX */
+    AS_TRY(as7341_write_reg(AS7341_REG_CONTROL, AS7341_CONTROL_SMUX_CMD));
 
     /* Wait SMUX (vai esperar o SMUXEN voltar a 0) */
     esp_err_t ret = as7341_wait_smux();
@@ -361,15 +345,13 @@ static esp_err_t as7341_start_measurement(
     }
 
     /* Start spectral measurement */
-    ESP_ERROR_CHECK(as7341_set_enable(true, true, false));
+    AS_TRY(as7341_set_enable(true, true, false));
     vTaskDelay(pdMS_TO_TICKS(1));
 
     /* Kick ADC conversion */
-    ESP_ERROR_CHECK(as7341_write_reg(AS7341_REG_CONTROL, AS7341_CONTROL_ADC_INIT));
+    AS_TRY(as7341_write_reg(AS7341_REG_CONTROL, AS7341_CONTROL_ADC_INIT));
 
-
-
-    /* Wait integration time */
+    /* Integracao ~83 ms (ATIME=29, ASTEP=999); o restante e coberto por wait_data */
     vTaskDelay(pdMS_TO_TICKS(50));
 
     return ESP_OK;

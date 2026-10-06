@@ -1,3 +1,24 @@
-build
-.vscode
-managed_components
+# --- ESP-IDF ---
+build/
+.vscode/
+managed_components/
+sdkconfig.old
+
+# --- ML: dataset e audios (milhares de arquivos) ---
+ml/dataset/*
+!ml/dataset/voicevote_v61_manifest.csv
+!ml/dataset/voicevote_v61_report.json
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# --- ML: ambiente Python e artefatos de treino ---
+ml/.venv/
+ml/build/
+ml/runs/
+__pycache__/
+*.pyc
+
+# --- diversos ---
+*.zip
