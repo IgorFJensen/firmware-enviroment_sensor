@@ -9,33 +9,17 @@
 #pragma once
 
 /* ------------------------------------------------------------------
- * Norma de referencia
- *   ENV_NORM_ANVISA_RE9   ANVISA RE n. 9/2003
- *                         T: 23-26 C (verao) e 20-22 C (inverno) -> 20-26 C
- *                         UR: 40-65 %
- *   ENV_NORM_NBR17037     ABNT NBR 17037:2023 (padrao que substitui a RE 9)
- *                         T: 21-26 C   UR: 35-65 %
+ * Norma de referencia: ABNT NBR 17037:2023
+ *   Qualidade do ar interior em ambientes nao residenciais climatizados
+ *   artificialmente. Substituiu a ANVISA RE n. 9/2003 em 25/07/2024.
+ *   Adotada como referencia para a residencia (nao ha norma residencial).
+ *   T: 21-26 C   UR: 35-65 %
  * ------------------------------------------------------------------ */
-#define ENV_NORM_ANVISA_RE9   1
-#define ENV_NORM_NBR17037     2
-
-#ifndef ENV_NORM
-#define ENV_NORM ENV_NORM_ANVISA_RE9
-#endif
-
-#if ENV_NORM == ENV_NORM_NBR17037
-  #define ENV_NORM_NAME          "ABNT NBR 17037:2023"
-  #define FLAG_TEMP_MIN_C        21.0f
-  #define FLAG_TEMP_MAX_C        26.0f
-  #define FLAG_HUMID_MIN_PCT     35.0f
-  #define FLAG_HUMID_MAX_PCT     65.0f
-#else
-  #define ENV_NORM_NAME          "ANVISA RE 9/2003"
-  #define FLAG_TEMP_MIN_C        20.0f
-  #define FLAG_TEMP_MAX_C        26.0f
-  #define FLAG_HUMID_MIN_PCT     40.0f
-  #define FLAG_HUMID_MAX_PCT     65.0f
-#endif
+#define ENV_NORM_NAME          "ABNT NBR 17037:2023"
+#define FLAG_TEMP_MIN_C        21.0f
+#define FLAG_TEMP_MAX_C        26.0f
+#define FLAG_HUMID_MIN_PCT     35.0f
+#define FLAG_HUMID_MAX_PCT     65.0f
 
 #define FLAG_DARK_LUX              10.0f    /* empirico: luz do comodo apagada        */
 #define FLAG_VOC_ELEVATED_INDEX    150.0f   /* Sensirion VOC Index (100 = media 24 h)  */
